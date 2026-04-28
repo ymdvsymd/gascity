@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
+	"github.com/gastownhall/gascity/internal/worker"
 )
 
 const (
@@ -269,11 +270,59 @@ func prepareStartCandidate(
 	store beads.Store,
 	clk clock.Clock,
 ) (*preparedStart, error) {
+	return prepareStartCandidateForCity(candidate, "", "", cfg, nil, store, clk, io.Discard)
+}
+
+func prepareStartCandidateForCity(
+	candidate startCandidate,
+	cityPath string,
+	cityName string,
+	cfg *config.City,
+	sp runtime.Provider,
+	store beads.Store,
+	clk clock.Clock,
+	stderr io.Writer,
+) (*preparedStart, error) {
 	session := candidate.session
 	if _, _, err := preWakeCommit(session, store, clk); err != nil {
 		return nil, err
 	}
+	candidate = refreshConfiguredNamedStartCandidate(candidate, cityPath, cityName, cfg, sp, store, clk, stderr)
 	return buildPreparedStart(candidate, cfg, store)
+}
+
+func refreshConfiguredNamedStartCandidate(
+	candidate startCandidate,
+	cityPath string,
+	cityName string,
+	cfg *config.City,
+	sp runtime.Provider,
+	store beads.Store,
+	clk clock.Clock,
+	stderr io.Writer,
+) startCandidate {
+	if candidate.session == nil || cfg == nil || store == nil || !isNamedSessionBead(*candidate.session) {
+		return candidate
+	}
+	if cityName == "" {
+		cityName = config.EffectiveCityName(cfg, "")
+	}
+	snapshot, err := loadSessionBeadSnapshot(store)
+	if err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "session reconciler: refreshing named session start %s: listing sessions: %v\n", candidate.name(), err) //nolint:errcheck
+		}
+		return candidate
+	}
+	refreshed, err := resolvePreservedConfiguredNamedSessionTemplate(cityPath, cityName, cfg, sp, store, snapshot.Open(), *candidate.session, clk, stderr)
+	if err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "session reconciler: refreshing named session start %s: %v\n", candidate.name(), err) //nolint:errcheck
+		}
+		return candidate
+	}
+	candidate.tp = refreshed
+	return candidate
 }
 
 func buildPreparedStart(
@@ -444,6 +493,17 @@ func executePreparedStartWave(
 	prepared []preparedStart,
 	sp runtime.Provider,
 	store beads.Store,
+	startupTimeout time.Duration,
+) []startResult {
+	return executePreparedStartWaveForCity(ctx, prepared, "", sp, store, nil, startupTimeout, 1)
+}
+
+func executePreparedStartWaveForCity(
+	ctx context.Context,
+	prepared []preparedStart,
+	cityPath string,
+	sp runtime.Provider,
+	store beads.Store,
 	cfg *config.City,
 	startupTimeout time.Duration,
 	maxParallel int,
@@ -451,7 +511,6 @@ func executePreparedStartWave(
 	if len(prepared) == 0 {
 		return nil
 	}
-	cityPath := ""
 	if maxParallel <= 0 {
 		maxParallel = 1
 	}
@@ -498,12 +557,17 @@ func executePreparedStartWave(
 			if err == nil && item.candidate.session != nil && item.candidate.session.Metadata["session_key"] != "" {
 				time.Sleep(staleKeyDetectDelay)
 				running := false
+				alive := false
 				if store == nil || strings.TrimSpace(item.candidate.session.ID) == "" {
 					running = sp != nil && sp.IsRunning(item.candidate.name())
+					alive = running && (sp == nil || sp.ProcessAlive(item.candidate.name(), item.cfg.ProcessNames))
 				} else {
-					running, err = workerSessionTargetRunningWithConfig(cityPath, store, sp, cfg, item.candidate.name())
+					var obs worker.LiveObservation
+					obs, err = workerObserveSessionTargetWithRuntimeHintsWithConfig(cityPath, store, sp, cfg, item.candidate.name(), item.cfg.ProcessNames)
+					running = obs.Running
+					alive = obs.Alive
 				}
-				if err != nil || !running {
+				if err != nil || !running || !alive {
 					err = fmt.Errorf("session %q died during startup", item.candidate.name())
 				}
 			}
@@ -690,6 +754,32 @@ func commitStartResultTraced(
 		ClearPendingCreateClaim: shouldRollbackPendingCreate(session),
 		Now:                     clk.Now(),
 	})
+	storedMCPSnapshot, err := sessionpkg.EncodeMCPServersSnapshot(result.prepared.cfg.MCPServers)
+	if err != nil {
+		fmt.Fprintf(stderr, "session reconciler: encoding MCP snapshot for %s: %v\n", name, err) //nolint:errcheck
+		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "metadata_encode_failed", result.started, result.finished, err)
+		return false
+	}
+	if storedMCPSnapshot != "" || session.Metadata[sessionpkg.MCPServersSnapshotMetadataKey] != "" {
+		metadata[sessionpkg.MCPServersSnapshotMetadataKey] = storedMCPSnapshot
+	}
+	if err := sessionpkg.PersistRuntimeMCPServersSnapshot(result.prepared.cfg.Env["GC_CITY_PATH"], session.ID, result.prepared.cfg.MCPServers); err != nil {
+		fmt.Fprintf(stderr, "session reconciler: storing runtime MCP snapshot for %s: %v\n", name, err) //nolint:errcheck
+		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, "runtime_mcp_snapshot_failed", result.started, result.finished, err)
+		return false
+	}
+	if result.prepared.candidate.tp.IsACP ||
+		session.Metadata[sessionpkg.MCPIdentityMetadataKey] != "" ||
+		session.Metadata[sessionpkg.MCPServersSnapshotMetadataKey] != "" {
+		storedMCPIdentity := firstNonEmptyGCString(
+			session.Metadata[sessionpkg.MCPIdentityMetadataKey],
+			session.Metadata[sessionpkg.NamedSessionIdentityMetadata],
+			session.Metadata["agent_name"],
+		)
+		if storedMCPIdentity != "" || session.Metadata[sessionpkg.MCPIdentityMetadataKey] != "" {
+			metadata[sessionpkg.MCPIdentityMetadataKey] = storedMCPIdentity
+		}
+	}
 	if err := store.SetMetadataBatch(session.ID, metadata); err != nil {
 		fmt.Fprintf(stderr, "session reconciler: storing hashes for %s: %v\n", name, err) //nolint:errcheck
 		if trace != nil {
@@ -843,7 +933,7 @@ func executePlannedStarts(
 	startupTimeout time.Duration,
 	stdout, stderr io.Writer,
 ) int {
-	return executePlannedStartsTraced(ctx, candidates, cfg, desiredState, sp, store, cityName, clk, rec, startupTimeout, stdout, stderr, nil)
+	return executePlannedStartsTraced(ctx, candidates, cfg, desiredState, sp, store, cityName, "", clk, rec, startupTimeout, stdout, stderr, nil)
 }
 
 func executePlannedStartsTraced(
@@ -854,6 +944,7 @@ func executePlannedStartsTraced(
 	sp runtime.Provider,
 	store beads.Store,
 	cityName string,
+	cityPath string,
 	clk clock.Clock,
 	rec events.Recorder,
 	startupTimeout time.Duration,
@@ -915,7 +1006,7 @@ func executePlannedStartsTraced(
 					logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "blocked_on_dependencies", time.Time{}, time.Time{}, nil)
 					continue
 				}
-				item, err := prepareStartCandidate(candidate, cfg, store, clk)
+				item, err := prepareStartCandidateForCity(candidate, cityPath, cityName, cfg, sp, store, clk, stderr)
 				if err != nil {
 					fmt.Fprintf(stderr, "session reconciler: pre-wake %s: %s\n", candidate.name(), formatLifecycleError(err)) //nolint:errcheck
 					logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "failed", time.Time{}, time.Time{}, err)
@@ -924,7 +1015,7 @@ func executePlannedStartsTraced(
 				prepared = append(prepared, *item)
 			}
 			offset = end
-			results := executePreparedStartWave(ctx, prepared, sp, store, cfg, startupTimeout, defaultMaxParallelStartsPerWave)
+			results := executePreparedStartWaveForCity(ctx, prepared, cityPath, sp, store, cfg, startupTimeout, defaultMaxParallelStartsPerWave)
 			for _, result := range results {
 				if trace != nil {
 					trace.recordOperation("reconciler.start.execute", result.prepared.candidate.tp.TemplateName, result.prepared.candidate.name(), "", "start", result.outcome, traceRecordPayload{
@@ -1205,7 +1296,35 @@ func stopTargetThroughWorkerBoundary(target stopTarget, store beads.Store, sp ru
 	if targetID == "" {
 		targetID = strings.TrimSpace(target.name)
 	}
+	if cityStopSessionMarked(store, target.sessionID) {
+		if err := workerKillSessionTargetWithConfig("", store, sp, cfg, targetID); err != nil {
+			return err
+		}
+		markCityStopSessionAsAsleep(store, target.sessionID, nil)
+		return nil
+	}
 	return workerStopSessionTargetWithConfig("", store, sp, cfg, targetID)
+}
+
+func cityStopSessionMarked(store beads.Store, sessionID string) bool {
+	if store == nil || strings.TrimSpace(sessionID) == "" {
+		return false
+	}
+	b, err := store.Get(sessionID)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(b.Metadata["sleep_reason"]) == sleepReasonCityStop
+}
+
+func markCityStopSessionAsAsleep(store beads.Store, sessionID string, stderr io.Writer) {
+	if store == nil || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	batch := sessionpkg.SleepPatch(time.Now().UTC(), sleepReasonCityStop)
+	if err := store.SetMetadataBatch(sessionID, batch); err != nil && stderr != nil {
+		fmt.Fprintf(stderr, "gc stop: marking session %s asleep: %v\n", sessionID, err) //nolint:errcheck
+	}
 }
 
 func interruptTargetsBounded(targets []stopTarget, cfg *config.City, store beads.Store, sp runtime.Provider, stderr io.Writer) int {

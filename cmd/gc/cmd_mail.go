@@ -213,7 +213,7 @@ func doMailCheckTargetWithFormat(mp mail.Provider, target resolvedMailTarget, in
 
 	if inject {
 		if len(messages) > 0 {
-			_ = writeProviderHookContext(stdout, hookFormat, formatInjectOutput(messages))
+			_ = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", formatInjectOutput(messages))
 		}
 		return 0 // --inject always exits 0
 	}
@@ -529,8 +529,8 @@ func resolveMailTargetsForCommand(identifier string, stderr io.Writer, cmdName s
 	if identifier == "" || identifier == "human" {
 		return resolvedMailTarget{display: "human", recipients: []string{"human"}}, true
 	}
-	if rawTarget, ok := resolveRawMailTargetForStorelessProvider(identifier, stderr, cmdName); ok {
-		return rawTarget, true
+	if isStorelessMailProvider() {
+		return resolveRawMailTargetForStorelessProvider(identifier, stderr, cmdName)
 	}
 	store, code := openCityStore(stderr, cmdName)
 	if store == nil {

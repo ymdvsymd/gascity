@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -541,6 +542,7 @@ func TestPrepareStartCandidate_UsesSessionIDForTaskWorkDir(t *testing.T) {
 }
 
 func TestExecutePlannedStarts_FreshWakeAfterDrainRetainsStartupContext(t *testing.T) {
+	skipSlowCmdGCTest(t, "waits through stale session-key detection; run make test-cmd-gc-process for full coverage")
 	sp := runtime.NewFake()
 	store := beads.NewMemStore()
 	clk := &clock.Fake{Time: time.Date(2026, 4, 7, 12, 0, 0, 0, time.UTC)}
@@ -989,6 +991,97 @@ func TestCommitStartResult_AtomicBatchFailureLeavesClaimIntact(t *testing.T) {
 	}
 	if got.Metadata["creation_complete_at"] != "" {
 		t.Fatalf("creation_complete_at = %q, want empty (atomic batch failed)", got.Metadata["creation_complete_at"])
+	}
+}
+
+func TestRefreshConfiguredNamedStartCandidateAddsCurrentSkillFingerprint(t *testing.T) {
+	resetSkillCatalogCache()
+	cityPath := t.TempDir()
+	writeTemplateResolveCityConfig(t, cityPath, "file")
+	if err := os.WriteFile(filepath.Join(cityPath, "pack.toml"),
+		[]byte("[pack]\nname = \"named-refresh-test\"\nversion = \"0.1.0\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(cityPath, "skills", "plan")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"),
+		[]byte("---\nname: plan\ndescription: test skill\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city", Provider: "claude"},
+		Session:       config.SessionConfig{Provider: "tmux"},
+		PackSkillsDir: filepath.Join(cityPath, "skills"),
+		Providers: map[string]config.ProviderSpec{
+			"claude": {Command: "true", PromptMode: "none", SupportsACP: boolPtr(true)},
+		},
+		Agents: []config.Agent{{
+			Name:     "mayor",
+			Scope:    "city",
+			Provider: "claude",
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "mayor",
+			Mode:     "always",
+		}},
+	}
+	store := beads.NewMemStore()
+	bead, err := store.Create(beads.Bead{
+		Title:  "mayor",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":               "mayor",
+			"session_name_explicit":      boolMetadata(true),
+			"template":                   "mayor",
+			"agent_name":                 "mayor",
+			"state":                      string(sessionpkg.StateCreating),
+			"pending_create_claim":       "true",
+			namedSessionMetadataKey:      boolMetadata(true),
+			namedSessionIdentityMetadata: "mayor",
+			namedSessionModeMetadata:     "always",
+			"continuation_epoch":         "1",
+			"generation":                 "1",
+			"instance_token":             sessionpkg.NewInstanceToken(),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stale := TemplateParams{
+		TemplateName: "mayor",
+		SessionName:  "mayor",
+		InstanceName: "mayor",
+		Command:      "true",
+		WorkDir:      cityPath,
+	}
+	candidate := startCandidate{session: &bead, tp: stale}
+	refreshed := refreshConfiguredNamedStartCandidate(
+		candidate,
+		cityPath,
+		cfg.Workspace.Name,
+		cfg,
+		runtime.NewFake(),
+		store,
+		&clock.Fake{Time: time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)},
+		ioDiscard{},
+	)
+
+	if _, ok := stale.FPExtra["skills:plan"]; ok {
+		t.Fatal("test setup invalid: stale candidate already had skills fingerprint")
+	}
+	if got := refreshed.tp.FPExtra["skills:plan"]; got == "" {
+		t.Fatalf("refreshed FPExtra missing skills:plan: %#v", refreshed.tp.FPExtra)
+	}
+	if refreshed.tp.ConfiguredNamedIdentity != "mayor" {
+		t.Fatalf("ConfiguredNamedIdentity = %q, want mayor", refreshed.tp.ConfiguredNamedIdentity)
+	}
+	if runtime.CoreFingerprint(templateParamsToConfig(refreshed.tp)) == runtime.CoreFingerprint(templateParamsToConfig(stale)) {
+		t.Fatal("refreshed candidate core fingerprint did not change after skill FPExtra refresh")
 	}
 }
 
@@ -1910,9 +2003,7 @@ func TestExecutePreparedStartWave_PanicIncludesStackTrace(t *testing.T) {
 		}},
 		&panicStartProvider{Fake: runtime.NewFake()},
 		nil,
-		nil,
 		time.Second,
-		1,
 	)
 	if len(results) != 1 {
 		t.Fatalf("len(results) = %d, want 1", len(results))
@@ -2133,7 +2224,23 @@ func (p *dieAfterStartProvider) IsRunning(name string) bool {
 	return p.Fake.IsRunning(name)
 }
 
+// zombieAfterStartProvider leaves the runtime container/pane present but marks
+// the actual agent process dead. This matches wrappers that keep tmux alive
+// after the CLI exits with a stale resume-session error.
+type zombieAfterStartProvider struct {
+	*runtime.Fake
+}
+
+func (p *zombieAfterStartProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	if err := p.Fake.Start(ctx, name, cfg); err != nil {
+		return err
+	}
+	p.Zombies[name] = true
+	return nil
+}
+
 func TestExecutePreparedStartWave_StaleSessionKeyDetected(t *testing.T) {
+	skipSlowCmdGCTest(t, "waits through stale session-key detection; run make test-cmd-gc-process for full coverage")
 	sp := &dieAfterStartProvider{Fake: runtime.NewFake()}
 	item := preparedStart{
 		candidate: startCandidate{
@@ -2159,9 +2266,7 @@ func TestExecutePreparedStartWave_StaleSessionKeyDetected(t *testing.T) {
 		[]preparedStart{item},
 		sp,
 		nil,
-		nil,
 		10*time.Second,
-		1,
 	)
 
 	if len(results) != 1 {
@@ -2170,6 +2275,50 @@ func TestExecutePreparedStartWave_StaleSessionKeyDetected(t *testing.T) {
 	r := results[0]
 	if r.err == nil {
 		t.Fatal("expected error for session that died during startup with stale key")
+	}
+	if !strings.Contains(r.err.Error(), "died during startup") {
+		t.Fatalf("unexpected error: %v", r.err)
+	}
+}
+
+func TestExecutePreparedStartWave_StaleSessionKeyDetectedWhenPaneSurvives(t *testing.T) {
+	sp := &zombieAfterStartProvider{Fake: runtime.NewFake()}
+	item := preparedStart{
+		candidate: startCandidate{
+			session: &beads.Bead{
+				ID: "gc-99",
+				Metadata: map[string]string{
+					"session_name": "test-agent",
+					"session_key":  "stale-key-abc",
+					"template":     "worker",
+				},
+			},
+			tp: TemplateParams{
+				Command:      "claude --resume stale-key-abc",
+				SessionName:  "test-agent",
+				TemplateName: "worker",
+			},
+		},
+		cfg: runtime.Config{
+			Command:      "claude --resume stale-key-abc",
+			ProcessNames: []string{"claude"},
+		},
+	}
+
+	results := executePreparedStartWave(
+		context.Background(),
+		[]preparedStart{item},
+		sp,
+		nil,
+		10*time.Second,
+	)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	r := results[0]
+	if r.err == nil {
+		t.Fatal("expected error for dead agent process left behind in a live pane")
 	}
 	if !strings.Contains(r.err.Error(), "died during startup") {
 		t.Fatalf("unexpected error: %v", r.err)
@@ -2203,9 +2352,7 @@ func TestExecutePreparedStartWave_NoStaleCheckWithoutSessionKey(t *testing.T) {
 		[]preparedStart{item},
 		sp,
 		nil,
-		nil,
 		10*time.Second,
-		1,
 	)
 
 	if len(results) != 1 {
@@ -2588,5 +2735,108 @@ func TestCommitStartResult_TransitionsCreatingToActive(t *testing.T) {
 	}
 	if got.Metadata["started_config_hash"] != "core-abc" {
 		t.Errorf("started_config_hash = %q, want %q", got.Metadata["started_config_hash"], "core-abc")
+	}
+}
+
+func TestCommitStartResult_PersistsMCPIdentityForACPStart(t *testing.T) {
+	store := beads.NewMemStore()
+	session, err := store.Create(beads.Bead{
+		Title:  "worker-session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "worker",
+			"agent_name":   "myrig/worker-adhoc-123",
+			"session_name": "worker-1",
+			"state":        "creating",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := startCandidate{
+		session: &session,
+		tp: TemplateParams{
+			TemplateName: "worker",
+			InstanceName: "worker-1",
+			IsACP:        true,
+		},
+	}
+	result := startResult{
+		prepared: preparedStart{
+			candidate: candidate,
+			cfg: runtime.Config{
+				MCPServers: []runtime.MCPServerConfig{{
+					Name:      "filesystem",
+					Transport: runtime.MCPTransportStdio,
+					Command:   "/bin/mcp",
+				}},
+			},
+			coreHash: "core-abc",
+			liveHash: "live-xyz",
+		},
+		outcome:  "success",
+		started:  time.Unix(100, 0),
+		finished: time.Unix(101, 0),
+	}
+	rec := events.NewFake()
+	ok := commitStartResult(result, store, &clock.Fake{Time: time.Unix(102, 0)}, rec, 0, ioDiscard{}, ioDiscard{})
+	if !ok {
+		t.Fatal("commitStartResult returned false for successful start")
+	}
+	got, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata[sessionpkg.MCPIdentityMetadataKey] != "myrig/worker-adhoc-123" {
+		t.Fatalf("mcp_identity = %q, want %q", got.Metadata[sessionpkg.MCPIdentityMetadataKey], "myrig/worker-adhoc-123")
+	}
+	if got.Metadata[sessionpkg.MCPServersSnapshotMetadataKey] == "" {
+		t.Fatal("mcp_servers_snapshot = empty, want persisted snapshot")
+	}
+}
+
+func TestStopTargetThroughWorkerBoundary_CityStopLeavesSessionAsleep(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	session, err := store.Create(beads.Bead{
+		Title:  "control-dispatcher",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "control-dispatcher",
+			"template":     "control-dispatcher",
+			"state":        "active",
+			"sleep_reason": sleepReasonCityStop,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := sp.Start(context.Background(), "control-dispatcher", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	err = stopTargetThroughWorkerBoundary(stopTarget{
+		sessionID: session.ID,
+		name:      "control-dispatcher",
+		resolved:  true,
+	}, store, sp, &config.City{})
+	if err != nil {
+		t.Fatalf("stopTargetThroughWorkerBoundary: %v", err)
+	}
+
+	got, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Metadata["state"] != string(sessionpkg.StateAsleep) {
+		t.Fatalf("state = %q, want %q", got.Metadata["state"], sessionpkg.StateAsleep)
+	}
+	if got.Metadata["sleep_reason"] != sleepReasonCityStop {
+		t.Fatalf("sleep_reason = %q, want %q", got.Metadata["sleep_reason"], sleepReasonCityStop)
+	}
+	if got.Metadata["suspended_at"] != "" {
+		t.Fatalf("suspended_at = %q, want empty", got.Metadata["suspended_at"])
 	}
 }

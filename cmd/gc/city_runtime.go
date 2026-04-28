@@ -271,14 +271,17 @@ func (cr *CityRuntime) run(ctx context.Context) {
 		lastProviderName = v
 	}
 
-	cityRoot := filepath.Dir(cr.tomlPath)
+	cityRoot := cr.cityPath
+	if cityRoot == "" && cr.tomlPath != "" {
+		cityRoot = filepath.Dir(cr.tomlPath)
+	}
 
 	// Enforce restrictive permissions on .gc/ and its subdirectories.
 	enforceGCPermissions(cr.cityPath, cr.stderr)
 
 	// Open standalone city bead store when controllerState is unavailable.
 	// When controllerState is present, it manages the cached city store.
-	if cr.cs == nil {
+	if cr.cs == nil && cityRoot != "" {
 		if store, err := openCityStoreAt(cityRoot); err != nil {
 			fmt.Fprintf(cr.stderr, "%s: city bead store: %v (auto-suspend disabled)\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
 		} else {
@@ -367,6 +370,11 @@ func (cr *CityRuntime) run(ctx context.Context) {
 
 	// Initialize convergence handler (requires bead store).
 	cr.initConvergenceHandler()
+	if ctx.Err() != nil {
+		return
+	}
+
+	cr.applyStartupConfigReload(ctx, dirty, &lastProviderName, cityRoot)
 	if ctx.Err() != nil {
 		return
 	}
@@ -665,6 +673,10 @@ func (cr *CityRuntime) tick(
 		}
 	}
 
+	// Order dispatch is intentionally before the expensive session reconcile
+	// phases so due formulas are not starved by slow startup/config drift work.
+	cr.dispatchOrders(ctx, cityRoot)
+
 	// Session bead sync BEFORE reconciliation (one-tick state lag; see run()).
 	// Post-reconcile sync was intentionally removed: the daemon's next tick
 	// corrects bead state, and the pre-reconcile sync is sufficient for
@@ -725,11 +737,6 @@ func (cr *CityRuntime) tick(
 		}
 	}
 
-	// Order dispatch.
-	if cr.od != nil {
-		cr.od.dispatch(ctx, cityRoot, time.Now())
-	}
-
 	if cr.svc != nil {
 		cr.svc.Tick(ctx, time.Now())
 	}
@@ -752,6 +759,12 @@ func (cr *CityRuntime) tick(
 	}
 	completion = TraceCompletionCompleted
 	tickCompleted = true
+}
+
+func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
+	if cr.od != nil {
+		cr.od.dispatch(ctx, cityRoot, time.Now())
+	}
 }
 
 func (cr *CityRuntime) handleReloadRequest(req *reloadRequest) {
@@ -812,6 +825,24 @@ func (cr *CityRuntime) reloadConfig(
 	cityRoot string,
 ) {
 	cr.reloadConfigTraced(ctx, lastProviderName, cityRoot, nil, reloadSourceWatch)
+}
+
+func (cr *CityRuntime) applyStartupConfigReload(
+	ctx context.Context,
+	dirty *atomic.Bool,
+	lastProviderName *string,
+	cityRoot string,
+) {
+	if cr.tomlPath == "" || cityRoot == "" || cr.configRev == "" || lastProviderName == nil || ctx.Err() != nil {
+		return
+	}
+	if dirty != nil {
+		dirty.Swap(false)
+	}
+	reply := cr.reloadConfigTraced(ctx, lastProviderName, cityRoot, nil, reloadSourceWatch)
+	if reply.Outcome == reloadOutcomeFailed && dirty != nil {
+		dirty.Store(true)
+	}
 }
 
 func (cr *CityRuntime) reloadConfigTraced(
@@ -1032,7 +1063,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 	cr.serviceStateMu.Unlock()
 
 	if cr.cs != nil {
-		cr.cs.update(nextCfg, nextSp)
+		cr.cs.updateFromRuntime(nextCfg, nextSp)
 	}
 	if cr.svc != nil {
 		if err := cr.svc.Reload(); err != nil {
@@ -1150,7 +1181,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	}
 	rigStores := cr.rigBeadStores()
 	assignedWorkBeads := result.AssignedWorkBeads
-	if released := releaseOrphanedPoolAssignments(store, cr.cfg, sessionBeads.Open(), assignedWorkBeads, result.AssignedWorkStores); len(released) > 0 {
+	if released := releaseOrphanedPoolAssignments(store, cr.cfg, sessionBeads.Open(), assignedWorkBeads, result.AssignedWorkStores, rigStores); len(released) > 0 {
 		for _, r := range released {
 			fmt.Fprintf(cr.stderr, "released orphaned pool work: %s\n", r.ID) //nolint:errcheck
 		}
@@ -1199,7 +1230,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 
 	cfgNames := configuredSessionNamesWithSnapshot(cr.cfg, cityName, sessionBeads)
 
-	readyWaitSet, err := prepareWaitWakeStateForCity(cr.cityPath, store, time.Now())
+	readyWaitSet, err := prepareWaitWakeStateForCityWithSnapshot(cr.cityPath, store, time.Now(), sessionBeads)
 	if err != nil {
 		fmt.Fprintf(cr.stderr, "%s: preparing waits: %v\n", cr.logPrefix, err) //nolint:errcheck
 		readyWaitSet = nil
@@ -1312,7 +1343,10 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 			})
 		}
 	}
-	if err := dispatchReadyWaitNudges(cr.cityPath, store, cr.sp, time.Now()); err != nil {
+	dispatchSessionBeads, err := loadSessionBeadSnapshot(store)
+	if err != nil {
+		fmt.Fprintf(cr.stderr, "%s: dispatching wait nudges: %v\n", cr.logPrefix, err) //nolint:errcheck
+	} else if err := dispatchReadyWaitNudgesWithSnapshot(cr.cityPath, store, time.Now(), dispatchSessionBeads); err != nil {
 		fmt.Fprintf(cr.stderr, "%s: dispatching wait nudges: %v\n", cr.logPrefix, err) //nolint:errcheck
 	}
 
@@ -1807,6 +1841,8 @@ func (cr *CityRuntime) shutdown() {
 				fmt.Fprintf(cr.stderr, "%s: shutdown session listing failed: %v\n", cr.logPrefix, listErr) //nolint:errcheck // best-effort stderr
 			}
 		}
-		gracefulStopAll(running, cr.sp, timeout, cr.rec, cr.cfg, cr.cityBeadStore(), cr.stdout, cr.stderr)
+		store := cr.cityBeadStore()
+		markCityStopSessionSleepReason(store, cr.stderr)
+		gracefulStopAll(running, cr.sp, timeout, cr.rec, cr.cfg, store, cr.stdout, cr.stderr)
 	})
 }
