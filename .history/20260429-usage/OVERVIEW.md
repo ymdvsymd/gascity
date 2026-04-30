@@ -100,44 +100,57 @@ bead の中身（種類とラベルの分類）は§7で扱う。本章では「
 
 ## 4. 作業を表す4層 — MEOW stack
 
-Gas City は仕事を4層で表現する。MEOW = **Molecular Expression of Work**（分子的な作業表現）。下の層ほど永続的で具体的、上の層ほど抽象的で再利用しやすい。
+Gas City は仕事を4層で表現する。MEOW = **Molecular Expression of Work**（分子的な作業表現）。一番上の「設計図」から一番下の「永続レコード」まで、下に行くほど具体的になる段階モデルである。
 
 ```mermaid
 graph TB
-    F[Formulas<br>TOML で書く設計図] -->|変数を埋める| P[Protomolecules<br>変数解決後の中間形]
-    P -->|具体化| M[Molecules / Wisps<br>実行時の bead ツリー]
-    M -->|永続化| B[Beads<br>個別の永続記録]
-    B -->|保存先| S[(bd / dolt)]
+    subgraph L1["Layer 1: Formulas — 設計図"]
+        F["formulas/*.toml<br>placeholder 入りの workflow 定義"]
+    end
+    subgraph L2["Layer 2: Protomolecules — 中間表現"]
+        P["変数解決済み Recipe<br>メモリのみ・一時"]
+    end
+    subgraph L3["Layer 3: Molecules / Wisps — 実行体"]
+        M["bead 群を一塊として扱う<br>formula 実行単位"]
+    end
+    subgraph L4["Layer 4: Beads — 永続レコード"]
+        B["bead store の個別レコード"]
+    end
+    F -->|"① 変換 (compile + 変数置換)"| P
+    P -->|"② 永続化 (Cook / Instantiate)"| M
+    M -.->|"③ 構成 (consists of)"| B
 ```
 
-各層の役割は次のとおり:
+各層の概要:
 
-| 層 | 何か | 永続性 | 代表的な操作 |
-|----|------|--------|-------------|
-| **Formulas** | 複数手順の workflow を TOML で書いた設計図 | ファイルとして残る | `formulas/<name>.toml` |
-| **Protomolecules** | formula の変数を実値で埋めた中間形 | 一時的（コンパイル中のみ） | `gc formula show --var name=Alice` |
-| **Molecules / Wisps** | 設計図を実体化した「実行時の bead ツリー」 | molecule は永続、wisp は使い捨て | `gc formula cook` / `gc sling --formula` |
-| **Beads** | 永続化される作業の最小単位 | 永続層に保存 | `bd create`、`bd show` |
+| 層 | 何か | 永続性 | 代表操作 |
+|----|------|--------|----------|
+| **L1: Formulas** | 複数手順の workflow を書いた TOML 設計図 | 永続（ファイル） | `formulas/<name>.toml` |
+| **L2: Protomolecules** | formula の `{{var}}` を実値で埋めた中間表現 | **一時（メモリのみ）** | `gc formula show --var name=...` |
+| **L3: Molecules / Wisps** | bead store に書き込まれた formula 実行体（bead 群の呼称） | 永続（bead store） | `gc formula cook` / `gc sling --formula` |
+| **L4: Beads** | bead store の最小レコード | 永続（bead store） | `bd create`、`bd show` |
 
-- **Formulas** は `[[steps]]` を並べて手順を書き、`needs` で順序を、`[vars]` で変数を、`[steps.condition]` などで実行条件を表現するTOMLファイルである。あくまで「設計図」で、実行体ではない。
-- **Protomolecules** は formula の `{{var}}` を実値に置換した、コンパイル中だけ存在する中間形である。`gc formula show feature-work --var title="ログイン"` を実行するとこの形が見られる。永続化はされない。
-- **Molecules** と **Wisps** は protomolecule をさらに具体化した実行体である。違いは「永続性と用途」にある。
-- **Beads** は最終的な永続化単位で、上の3層もすべて最終的にここで永続化される。bead の世界観は§3で見たとおり。
+層の間には、それぞれ違う種類の関係がある:
+
+1. **L1 → L2 は変換** — `{{var}}` を実値に置換して Protomolecule を作る。**まだ永続化されない**。
+2. **L2 → L3 は永続化** — Cook / Instantiate で bead store に書き込まれ、Molecule / Wisp が生まれる。**永続化はここ一回だけ**。
+3. **L3 → L4 は構成** — Molecule / Wisp は新たな永続実体ではない。書き込まれた bead 群を「一塊」として扱う論理ビューであり、Bead レイヤーへの別名にあたる。
 
 ### molecule と wisp の使い分け
 
-molecule と wisp は、混同されやすいので個別に整理する。
+両者の違いは「**bead 化される粒度**」と「**ライフサイクル**」の二軸で整理する。`internal/formula/recipe.go` の `RootOnly` フラグがこの分岐を司っており、vapor-phase で `pour=false` のとき `RootOnly=true` となって root 以外のステップは bead 化されず root の本文に折り込まれる。
 
 | 観点 | molecule | wisp |
 |------|----------|------|
-| 永続性 | 各手順を独立した bead として保存し、複数のエージェントで分担できる | root の bead だけを残し、各手順は本文に折り込んで一括処理する。一定時間で破棄される |
-| 用途 | 長期的・複数人体制で進める workflow | 単一エージェントに一発で投げる短期 workflow |
-| 後始末 | 明示的に閉じるまで残る | 時間経過で自動的に消える |
-| 起動コマンド | `gc formula cook` | `gc sling --formula`、または定期ジョブ（order）からの自動発火 |
+| **bead 化される粒度** (RootOnly) | `RootOnly=false`：root + 各手順を**それぞれ独立した bead として書き込む**（N+1 件） | `RootOnly=true`：root bead **1 件のみ**書き込み、各手順は root の本文に折り込む |
+| 永続化の有無 | 永続化される | **永続化される**（root bead 1 件として bead store に書かれる） |
+| 個別ステップを別エージェントが拾えるか | 拾える（独立 bead なので） | 拾えない（bead 化されていない） |
+| 親 bead が close したとき | そのまま残る | 自動 close（`wisp_autoclose`） |
+| close 後のレコード | 明示削除まで残る | TTL 経過後に GC で物理削除（`wispGC`） |
+| 用途 | 長期的・複数エージェント分担の workflow | 親仕事に貼り付ける短命の workflow |
+| 起動コマンド | `gc formula cook`（pour 形式） | `gc sling --formula`、order からの自動発火（vapor 形式） |
 
-つまり、長期で複数のエージェントが触る仕事は molecule、その場限りの一発仕事は wisp、という使い分けになる。
-
-MEOW stack の重要な性質は、**この4層がすべて、後述する3つの原始要素（設定・bead store・event bus）の組み合わせで実装できる**ことにある。役割名が Goコードに現れることもなく、すべて TOML とプロンプトで表現される。これが §5 の議論につながる。
+MEOW stack の重要な性質は、**この4層がすべて、後述する5つの原始要素（設定・bead store・event bus・agent protocol・prompt templates）の組み合わせで実装できる**ことにある。役割名が Go コードに現れることもなく、すべて TOML とプロンプトで表現される。これが §5 の議論につながる。
 
 ---
 
@@ -148,26 +161,33 @@ Gas City は、5つの**原始要素**（これ以上分割できない構成要
 ```mermaid
 graph TB
     subgraph 原始要素[5つの原始要素]
+        direction LR
         A1[Agent Protocol<br>provider 抽象]
         A2[Task Store / Beads<br>永続化された作業]
         A3[Event Bus<br>追記専用ログ]
         A4[Config<br>TOML と多層設定]
         A5[Prompt Templates<br>Markdownの振る舞い記述]
+        A1 ~~~ A2 ~~~ A3 ~~~ A4 ~~~ A5
     end
     subgraph 派生機構[4つの派生機構]
-        B1[Messaging<br>= A1 + A2]
-        B2[Formulas & Molecules<br>= A2 + A4]
-        B3[Dispatch / Sling<br>= A1 + A2 + A3 + A4]
+        direction LR
+        B1[Messaging<br>= A1 + A2 + A5]
+        B2[Formulas & Molecules<br>= A2 + A4 + A5]
+        B3[Dispatch / Sling<br>= A1 + A2 + A3 + A4 + A5]
         B4[Health Patrol<br>= A1 + A3 + A4]
+        B1 ~~~ B2 ~~~ B3 ~~~ B4
     end
     A1 --> B1
     A2 --> B1
+    A5 --> B1
     A2 --> B2
     A4 --> B2
+    A5 --> B2
     A1 --> B3
     A2 --> B3
     A3 --> B3
     A4 --> B3
+    A5 --> B3
     A1 --> B4
     A3 --> B4
     A4 --> B4
@@ -183,9 +203,9 @@ graph TB
 
 ### 4つの派生機構
 
-- **Messaging（= Agent Protocol + Task Store）** — エージェント間メールの正体は、`type = "message"` の bead を1件作ることである。`gc mail send` は内部で `internal/mail/beadmail/` 経由で bead を作るだけ。受信側は次のターンで hook 経由で受信箱を確認し、自分宛のメッセージを context に取り込む。生きているターミナルに直接テキストを流す `gc nudge` は、Agent Protocol の prompt送信を素直に呼ぶ。主に使うコマンドは `gc mail send/inbox/read`、`gc nudge`。
-- **Formulas & Molecules（= Task Store + Config）** — formula は Config が TOML から読み込み、molecule は Task Store の中で「root の bead と各手順の子 beads からなる木」として表現される。MEOW stack の中段（§4）の実装にあたる。主に使うコマンドは `gc formula list/show/cook`、`gc sling --formula`。
-- **Dispatch / Sling（= Agent Protocol + Task Store + Event Bus + Config）** — 「仕事を見つける／作る → エージェントに渡す → 関連する beads をまとめる convoy を作る → イベントログに残す」という一連の合成手続き。`gc sling` がこれを駆動する。原始要素を4つ全部使う、もっとも厚みのある合成機構。
+- **Messaging（= Agent Protocol + Task Store + Prompt Templates）** — エージェント間メールの正体は、`type = "message"` の bead を1件作ることである。`gc mail send` は内部で `internal/mail/beadmail/` 経由で bead を作るだけ。受信側は次のターンで hook 経由で受信箱を確認し、自分宛のメッセージを context に取り込み、prompt template の手順で読み・返信する。生きているターミナルに直接テキストを流す `gc nudge` は、Agent Protocol の prompt送信を素直に呼ぶ。主に使うコマンドは `gc mail send/inbox/read`、`gc nudge`。
+- **Formulas & Molecules（= Task Store + Config + Prompt Templates）** — formula は Config が TOML から読み込み、molecule は Task Store の中で「root の bead と各手順の子 beads からなる木」として表現され、各手順の中身は担当エージェントの prompt template が埋める。MEOW stack の中段（§4）の実装にあたる。主に使うコマンドは `gc formula list/show/cook`、`gc sling --formula`。
+- **Dispatch / Sling（= Agent Protocol + Task Store + Event Bus + Config + Prompt Templates）** — 「仕事を見つける／作る → prompt template でエージェントを起こして渡す → 関連する beads をまとめる convoy を作る → イベントログに残す」という一連の合成手続き。`gc sling` がこれを駆動する。原始要素を5つ全部使う、もっとも厚みのある合成機構。
 - **Health Patrol（= Agent Protocol + Event Bus + Config）** — controller が一定間隔でエージェントの生存と進捗を確認し（Agent Protocol）、Configの閾値と比べ、停滞を Event Bus に通知する。停滞が続けば再起動を試みる。主な設定キーは `daemon.patrol_interval`。
 
 ### 階層の不変条件
