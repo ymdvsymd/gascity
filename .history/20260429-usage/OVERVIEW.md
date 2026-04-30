@@ -206,7 +206,7 @@ graph TB
 - **Messaging（= Agent Protocol + Task Store + Prompt Templates）** — エージェント間メールの正体は、`type = "message"` の bead を1件作ることである。`gc mail send` は内部で `internal/mail/beadmail/` 経由で bead を作るだけ。受信側は次のターンで hook 経由で受信箱を確認し、自分宛のメッセージを context に取り込み、prompt template の手順で読み・返信する。生きているターミナルに直接テキストを流す `gc nudge` は、Agent Protocol の prompt送信を素直に呼ぶ。主に使うコマンドは `gc mail send/inbox/read`、`gc nudge`。
 - **Formulas & Molecules（= Task Store + Config + Prompt Templates）** — formula は Config が TOML から読み込み、molecule は Task Store の中で「root の bead と各手順の子 beads からなる木」として表現され、各手順の中身は担当エージェントの prompt template が埋める。MEOW stack の中段（§4）の実装にあたる。主に使うコマンドは `gc formula list/show/cook`、`gc sling --formula`。
 - **Dispatch / Sling（= Agent Protocol + Task Store + Event Bus + Config + Prompt Templates）** — 「仕事を見つける／作る → prompt template でエージェントを起こして渡す → 関連する beads をまとめる convoy を作る → イベントログに残す」という一連の合成手続き。`gc sling` がこれを駆動する。原始要素を5つ全部使う、もっとも厚みのある合成機構。
-- **Health Patrol（= Agent Protocol + Event Bus + Config）** — controller が一定間隔でエージェントの生存と進捗を確認し（Agent Protocol）、Configの閾値と比べ、停滞を Event Bus に通知する。停滞が続けば再起動を試みる。主な設定キーは `daemon.patrol_interval`。
+- **Health Patrol（= Agent Protocol + Event Bus + Config）** — controller が一定間隔でエージェントの生存と進捗を確認し（Agent Protocol）、`idle_timeout` や `max_restarts` / `restart_window` などの閾値（Config）と比べる。idle 超過ならセッションを kill して即時再起動、短時間に再起動が繰り返されればクラッシュループとみなし5分間 quarantine して wake を抑制する。経緯は Event Bus に流れて外部から観測できる。主な設定キーは `daemon.patrol_interval`、`idle_timeout`、`max_restarts` / `restart_window`。
 
 ### 階層の不変条件
 
