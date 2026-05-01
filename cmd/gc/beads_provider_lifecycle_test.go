@@ -2178,74 +2178,46 @@ func TestInitBeadsForDirExecWithoutCityPathPreservesAmbientEnv(t *testing.T) {
 }
 
 func TestInitBeadsForDirExecPreventsStrayGitInit(t *testing.T) {
-	skipSlowCmdGCTest(t, "uses real bd init process behavior; run make test-cmd-gc-process for full coverage")
-	configureTestDoltIdentityEnv(t)
-
-	findRealBD := func() string {
-		t.Helper()
-		for _, dir := range strings.Split(os.Getenv("PATH"), string(os.PathListSeparator)) {
-			if strings.TrimSpace(dir) == "" {
-				continue
-			}
-			candidate := filepath.Join(dir, "bd")
-			info, err := os.Stat(candidate)
-			if err != nil || info.Mode()&0o111 == 0 {
-				continue
-			}
-			helpCmd := exec.Command(candidate, "--help")
-			helpCmd.Env = sanitizedBaseEnv()
-			out, err := helpCmd.CombinedOutput()
-			if err == nil && strings.Contains(string(out), "Initialize bd in the current directory") {
-				return candidate
-			}
-		}
-		t.Skip("real bd with init support not found in PATH")
-		return ""
-	}
-	bdPath := findRealBD()
-
-	rawDir := t.TempDir()
-	rawCmd := exec.Command(bdPath, "init", "--quiet", "--server", "--prefix", "raw", "--skip-hooks", "--skip-agents", ".")
-	rawCmd.Dir = rawDir
-	rawCmd.Env = sanitizedBaseEnv()
-	rawOut, err := rawCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("direct bd init failed: %v\n%s", err, rawOut)
-	}
-	if _, err := os.Stat(filepath.Join(rawDir, ".beads")); err != nil {
-		t.Fatalf("direct bd init did not create .beads: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(rawDir, ".git")); err == nil {
-		t.Log("direct bd init created .git without BEADS_DIR")
-	} else if !os.IsNotExist(err) {
-		t.Fatalf("stat direct bd init .git: %v", err)
-	}
-
-	cityDir := t.TempDir()
-	writeMinimalCityToml(t, cityDir)
-	rigDir := filepath.Join(cityDir, "frontend")
-	if err := os.MkdirAll(rigDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	script := filepath.Join(t.TempDir(), "provider.sh")
-	content := fmt.Sprintf(`#!/bin/sh
+	script := filepath.Join(t.TempDir(), "bd-like-provider.sh")
+	content := `#!/bin/sh
 set -eu
 op="$1"
 shift
 case "$op" in
   init)
     dir="$1"
-    prefix="$2"
-    cd "$dir"
-    exec %q init --quiet --server --prefix "$prefix" --skip-hooks --skip-agents .
+    mkdir -p "$dir/.beads"
+    if [ -z "${BEADS_DIR:-}" ]; then
+      mkdir -p "$dir/.git"
+    fi
     ;;
   *)
     exit 0
     ;;
 esac
-`, bdPath)
+`
 	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rawDir := t.TempDir()
+	rawCmd := exec.Command(script, "init", rawDir, "raw")
+	rawCmd.Env = sanitizedBaseEnv()
+	rawOut, err := rawCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("direct provider init failed: %v\n%s", err, rawOut)
+	}
+	if _, err := os.Stat(filepath.Join(rawDir, ".beads")); err != nil {
+		t.Fatalf("direct provider init did not create .beads: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rawDir, ".git")); err != nil {
+		t.Fatalf("direct provider init did not emulate stray .git creation: %v", err)
+	}
+
+	cityDir := t.TempDir()
+	writeMinimalCityToml(t, cityDir)
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2903,6 +2875,118 @@ func TestGcBeadsBdStartUsesRootBeadsDataDir(t *testing.T) {
 	}
 	if _, err := os.Stat(poisonStateFile); !os.IsNotExist(err) {
 		t.Fatalf("start leaked ambient GC_* state to %q, stat err = %v", poisonStateFile, err)
+	}
+}
+
+func TestGcBeadsBdStartRetriesAutoPortBindConflict(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"demo\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := MaterializeBuiltinPacks(cityPath); err != nil {
+		t.Fatalf("MaterializeBuiltinPacks: %v", err)
+	}
+	script := gcBeadsBdScriptPath(cityPath)
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := t.TempDir()
+	attemptsFile := filepath.Join(stateDir, "attempts")
+	portsFile := filepath.Join(stateDir, "ports")
+
+	fakeDolt := filepath.Join(binDir, "dolt")
+	fakeDoltScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+attempts_file=%q
+ports_file=%q
+cmd="${1:-}"
+case "$cmd" in
+  config)
+    exit 0
+    ;;
+  --host)
+    exit 0
+    ;;
+  sql-server)
+    config_file=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --config)
+          shift
+          config_file="$1"
+          ;;
+      esac
+      shift || true
+    done
+    port=$(awk '/^[[:space:]]*port:/{print $2; exit}' "$config_file")
+    printf '%%s\n' "$port" >> "$ports_file"
+    count=0
+    if [ -f "$attempts_file" ]; then
+      count=$(cat "$attempts_file")
+    fi
+    count=$((count + 1))
+    printf '%%s\n' "$count" > "$attempts_file"
+    if [ "$count" -eq 1 ]; then
+      echo "Starting server with Config HP=\"0.0.0.0:${port}\"|T=\"300000\"|R=\"false\"|L=\"warning\""
+      echo "listen tcp 0.0.0.0:${port}: bind: address already in use"
+      exit 1
+    fi
+    sleep 60
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`, attemptsFile, portsFile)
+	if err := os.WriteFile(fakeDolt, []byte(fakeDoltScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeNC := filepath.Join(binDir, "nc")
+	if err := os.WriteFile(fakeNC, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptEnv := sanitizedBaseEnv(
+		"GC_CITY_PATH="+cityPath,
+		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
+	)
+	t.Cleanup(func() {
+		cmd := exec.Command(script, "stop")
+		cmd.Env = scriptEnv
+		_ = cmd.Run()
+	})
+
+	cmd := exec.Command(script, "start")
+	cmd.Env = scriptEnv
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("start: %v\n%s", err, out)
+	}
+
+	data, err := os.ReadFile(portsFile)
+	if err != nil {
+		t.Fatalf("read attempted ports: %v", err)
+	}
+	ports := strings.Fields(string(data))
+	if len(ports) != 2 {
+		t.Fatalf("attempted ports = %v, want two startup attempts", ports)
+	}
+	if ports[0] == ports[1] {
+		t.Fatalf("retry reused busy port %s", ports[0])
+	}
+
+	state, err := readDoltRuntimeStateFile(providerManagedDoltStatePath(cityPath))
+	if err != nil {
+		t.Fatalf("read provider state: %v", err)
+	}
+	if got := strconv.Itoa(state.Port); got != ports[1] {
+		t.Fatalf("provider state port = %q, want retry port %q", got, ports[1])
 	}
 }
 

@@ -45,7 +45,16 @@ type DesiredStateResult struct {
 	// store failure would cause running sessions to be falsely orphaned
 	// and interrupted via Ctrl-C.
 	StoreQueryPartial bool
-	BeaconTime        time.Time
+	// SessionQueryPartial is true when session-bead snapshot loading failed.
+	// Orphan-release and drain decisions must treat this like an incomplete
+	// work snapshot because missing live session beads make assigned work look
+	// orphaned.
+	SessionQueryPartial bool
+	BeaconTime          time.Time
+}
+
+func (r DesiredStateResult) snapshotQueryPartial() bool {
+	return r.StoreQueryPartial || r.SessionQueryPartial
 }
 
 type poolEvalWork struct {
@@ -169,14 +178,18 @@ func buildDesiredState(
 	stderr io.Writer,
 ) DesiredStateResult {
 	var sessionBeads *sessionBeadSnapshot
+	var sessionQueryPartial bool
 	if store != nil {
 		var err error
 		sessionBeads, err = loadSessionBeadSnapshot(store)
 		if err != nil {
 			fmt.Fprintf(stderr, "buildDesiredState: listing session beads: %v\n", err) //nolint:errcheck
+			sessionQueryPartial = true
 		}
 	}
-	return buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, store, nil, sessionBeads, nil, stderr)
+	result := buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, store, nil, sessionBeads, nil, stderr)
+	result.SessionQueryPartial = result.SessionQueryPartial || sessionQueryPartial
+	return result
 }
 
 func buildDesiredStateWithSessionBeads(
@@ -529,26 +542,50 @@ func collectAssignedWorkBeadsWithStores(
 		}
 	}
 
+	type storeAssignedWorkResult struct {
+		beads  []beads.Bead
+		stores []beads.Store
+		errs   []error
+	}
+	results := make([]storeAssignedWorkResult, len(stores))
+	var wg sync.WaitGroup
+	for idx, s := range stores {
+		idx, s := idx, s
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var result []beads.Bead
+			var resultStores []beads.Store
+			var errs []error
+			seen := make(map[string]struct{})
+			// In-progress beads with an assignee (active work), plus stranded
+			// unassigned pool work that needs to be reopened.
+			if inProgress, err := s.List(beads.ListQuery{Status: "in_progress", Live: true}); err == nil {
+				appendInProgressWorkUnique(cfg, &result, &resultStores, inProgress, seen, s)
+			} else {
+				errs = append(errs, fmt.Errorf("List(in_progress): %w", err))
+			}
+			// Ready beads with an assignee (queued direct handoff work that is
+			// actually runnable, not merely open). This is a lifecycle gate, so
+			// bypass the cache when a CachingStore wrapper is present.
+			if ready, err := beads.ReadyLive(s); err == nil {
+				appendAssignedUnique(&result, &resultStores, ready, seen, s)
+			} else {
+				errs = append(errs, fmt.Errorf("Ready(): %w", err))
+			}
+			results[idx] = storeAssignedWorkResult{beads: result, stores: resultStores, errs: errs}
+		}()
+	}
+	wg.Wait()
+
 	var result []beads.Bead
 	var resultStores []beads.Store
 	var partial bool
-	for _, s := range stores {
-		seen := make(map[string]struct{})
-		// In-progress beads with an assignee (active work), plus stranded
-		// unassigned pool work that needs to be reopened.
-		if inProgress, err := s.List(beads.ListQuery{Status: "in_progress", Live: true}); err == nil {
-			appendInProgressWorkUnique(cfg, &result, &resultStores, inProgress, seen, s)
-		} else {
-			log.Printf("collectAssignedWorkBeads: List(in_progress) failed: %v", err)
-			partial = true
-		}
-		// Ready beads with an assignee (queued direct handoff work that is
-		// actually runnable, not merely open). This is a lifecycle gate, so
-		// bypass the cache when a CachingStore wrapper is present.
-		if ready, err := beads.ReadyLive(s); err == nil {
-			appendAssignedUnique(&result, &resultStores, ready, seen, s)
-		} else {
-			log.Printf("collectAssignedWorkBeads: Ready() failed: %v", err)
+	for _, r := range results {
+		result = append(result, r.beads...)
+		resultStores = append(resultStores, r.stores...)
+		for _, err := range r.errs {
+			log.Printf("collectAssignedWorkBeads: %v", err)
 			partial = true
 		}
 	}
@@ -784,13 +821,7 @@ func discoverSessionBeadsWithRoots(
 }
 
 func isPendingPoolCreate(b beads.Bead) bool {
-	if !isPoolManagedSessionBead(b) || strings.TrimSpace(b.Metadata["pending_create_claim"]) != boolMetadata(true) {
-		return false
-	}
-	if strings.TrimSpace(b.Metadata["state"]) != "creating" {
-		return false
-	}
-	return true
+	return isPoolManagedSessionBead(b) && strings.TrimSpace(b.Metadata["pending_create_claim"]) == boolMetadata(true)
 }
 
 func realizeDependencyFloors(

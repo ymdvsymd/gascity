@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -911,6 +912,63 @@ func TestCachingStoreCloseNotifiesWhenBeadIsMissingFromCache(t *testing.T) {
 	}
 }
 
+func TestCachingStoreListByLabelSeesCreatedBeadAfterMetadataWrite(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		prime func(*beads.CachingStore) error
+	}{
+		{
+			name:  "partial",
+			prime: func(cs *beads.CachingStore) error { return cs.PrimeActive() },
+		},
+		{
+			name:  "live",
+			prime: func(cs *beads.CachingStore) error { return cs.Prime(context.Background()) },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			mem := beads.NewMemStore()
+			cs := beads.NewCachingStoreForTest(mem, nil)
+			if err := tc.prime(cs); err != nil {
+				t.Fatalf("prime: %v", err)
+			}
+
+			created, err := cs.Create(beads.Bead{
+				Title:  "worker",
+				Type:   "session",
+				Labels: []string{"gc.session", "agent:worker"},
+			})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if err := cs.SetMetadata(created.ID, "session_name", "s-"+created.ID); err != nil {
+				t.Fatalf("SetMetadata(session_name): %v", err)
+			}
+
+			got, err := cs.List(beads.ListQuery{
+				Label: "gc.session",
+				Sort:  beads.SortCreatedAsc,
+			})
+			if err != nil {
+				t.Fatalf("List(label): %v", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("List(label) len = %d, want 1", len(got))
+			}
+			if got[0].ID != created.ID {
+				t.Fatalf("List(label) ID = %q, want %q", got[0].ID, created.ID)
+			}
+			if got[0].Metadata["session_name"] != "s-"+created.ID {
+				t.Fatalf("session_name = %q, want %q", got[0].Metadata["session_name"], "s-"+created.ID)
+			}
+		})
+	}
+}
+
 func TestCachingStoreApplyEvent(t *testing.T) {
 	t.Parallel()
 	mem := beads.NewMemStore()
@@ -921,12 +979,13 @@ func TestCachingStoreApplyEvent(t *testing.T) {
 		t.Fatalf("Prime: %v", err)
 	}
 
-	// Apply a create event for a bead that doesn't exist in cache yet.
-	newBead := beads.Bead{ID: "ext-1", Title: "External", Status: "open"}
-	payload, _ := json.Marshal(newBead)
+	// Apply a create event for a bead that exists in the backing store but
+	// doesn't exist in cache yet.
+	external, _ := mem.Create(beads.Bead{Title: "External"})
+	payload, _ := json.Marshal(beads.Bead{ID: external.ID, Title: "External", Status: "open"})
 	cs.ApplyEvent("bead.created", payload)
 
-	got := requireCachedBead(t, cs, "ext-1", false)
+	got := requireCachedBead(t, cs, external.ID, false)
 	if got.Title != "External" {
 		t.Fatalf("title = %q, want External", got.Title)
 	}
@@ -988,6 +1047,95 @@ func TestCachingStoreApplyEvent(t *testing.T) {
 	}
 	if got.Metadata["gc.step_ref"] != "" {
 		t.Fatalf("close event should replace stale metadata, got %v", got.Metadata)
+	}
+}
+
+func TestCachingStoreApplyEventIgnoresUnknownForeignBead(t *testing.T) {
+	t.Parallel()
+	mem := beads.NewMemStore()
+	backing := &eventGetFailStore{Store: mem, failGet: true}
+	cs := beads.NewCachingStoreForTestWithPrefix(backing, "gc", nil)
+	if err := cs.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	for _, eventType := range []string{"bead.created", "bead.updated", "bead.closed"} {
+		payload, err := json.Marshal(beads.Bead{
+			ID:     "foreign-" + eventType,
+			Title:  "belongs to another store",
+			Status: "open",
+		})
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		cs.ApplyEvent(eventType, payload)
+	}
+
+	items, err := cs.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+	if err != nil {
+		t.Fatalf("List cached beads: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("cached foreign beads = %#v, want none", items)
+	}
+	if stats := cs.Stats(); stats.ProblemCount != 0 {
+		t.Fatalf("ProblemCount = %d, want 0 (last problem: %s)", stats.ProblemCount, stats.LastProblem)
+	}
+}
+
+func TestCachingStoreApplyEventRefreshesOwnedUnknownBeadFromBacking(t *testing.T) {
+	t.Parallel()
+	mem := beads.NewMemStore()
+	backing := &eventGetFailStore{Store: mem}
+	cs := beads.NewCachingStoreForTestWithPrefix(backing, "gc", nil)
+	if err := cs.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+	created, err := mem.Create(beads.Bead{
+		Title:    "owned external bead",
+		Labels:   []string{"from-backing"},
+		Metadata: map[string]string{"gc.step_ref": "mol.review"},
+	})
+	if err != nil {
+		t.Fatalf("Create backing bead: %v", err)
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"id":     created.ID,
+		"status": "open",
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	cs.ApplyEvent("bead.updated", payload)
+
+	got := requireCachedBead(t, cs, created.ID, false)
+	if got.Title != "owned external bead" {
+		t.Fatalf("title = %q, want owned external bead", got.Title)
+	}
+	if len(got.Labels) != 1 || got.Labels[0] != "from-backing" {
+		t.Fatalf("labels = %#v, want [from-backing]", got.Labels)
+	}
+	if got.Metadata["gc.step_ref"] != "mol.review" {
+		t.Fatalf("metadata = %#v, want gc.step_ref=mol.review", got.Metadata)
+	}
+}
+
+func TestNewCachingStoreRecordsProblemForMissingProductionPrefix(t *testing.T) {
+	t.Parallel()
+	backing := beads.NewBdStore(t.TempDir(), func(string, string, ...string) ([]byte, error) {
+		t.Fatal("runner should not be called")
+		return nil, nil
+	})
+	cs := beads.NewCachingStore(backing, nil)
+
+	stats := cs.Stats()
+	if stats.ProblemCount != 1 {
+		t.Fatalf("ProblemCount = %d, want 1", stats.ProblemCount)
+	}
+	if !strings.Contains(stats.LastProblem, "missing issue prefix") {
+		t.Fatalf("LastProblem = %q, want missing issue prefix", stats.LastProblem)
 	}
 }
 
@@ -1065,6 +1213,10 @@ func (s *eventGetFailStore) Get(id string) (beads.Bead, error) {
 func TestCachingStoreApplyEventCoercesNonStringMetadata(t *testing.T) {
 	t.Parallel()
 	mem := beads.NewMemStore()
+	created, err := mem.Create(beads.Bead{Title: "mayor"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
 
 	cs := beads.NewCachingStoreForTest(mem, nil)
 	if err := cs.Prime(context.Background()); err != nil {
@@ -1072,7 +1224,7 @@ func TestCachingStoreApplyEventCoercesNonStringMetadata(t *testing.T) {
 	}
 
 	payload, err := json.Marshal(map[string]any{
-		"id":         "ext-1",
+		"id":         created.ID,
 		"title":      "mayor",
 		"status":     "open",
 		"issue_type": "session",
@@ -1094,7 +1246,7 @@ func TestCachingStoreApplyEventCoercesNonStringMetadata(t *testing.T) {
 		t.Fatalf("ProblemCount = %d, want 0 (last problem: %s)", stats.ProblemCount, stats.LastProblem)
 	}
 
-	got := requireCachedBead(t, cs, "ext-1", false)
+	got := requireCachedBead(t, cs, created.ID, false)
 	if got.Type != "session" {
 		t.Fatalf("Type = %q, want session", got.Type)
 	}

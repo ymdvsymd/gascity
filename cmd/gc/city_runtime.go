@@ -382,6 +382,16 @@ func (cr *CityRuntime) run(ctx context.Context) {
 		return
 	}
 
+	// Dispatch due orders before startup session reconciliation. A cold-start
+	// reconcile can take minutes when it has stale or config-drifted sessions;
+	// due event/condition formulas should not wait behind that maintenance work.
+	cr.safeTick(func() {
+		cr.dispatchOrders(ctx, cityRoot)
+	}, "startup-orders")
+	if ctx.Err() != nil {
+		return
+	}
+
 	// Session bead sync BEFORE reconciliation: ensures beads exist for
 	// the reconciler to read/write hashes. Uses ListByLabel (indexed,
 	// fast even before CachingStore is primed).
@@ -765,6 +775,9 @@ func (cr *CityRuntime) tick(
 }
 
 func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
+	if ctx.Err() != nil {
+		return
+	}
 	if cr.od != nil {
 		cr.od.dispatch(ctx, cityRoot, time.Now())
 	}
@@ -1180,11 +1193,14 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	}
 
 	if sessionBeads == nil {
-		sessionBeads = cr.loadSessionBeadSnapshot()
+		var sessionQueryPartial bool
+		sessionBeads, sessionQueryPartial = cr.loadSessionBeadSnapshotWithPartial()
+		result.SessionQueryPartial = result.SessionQueryPartial || sessionQueryPartial
 	}
 	rigStores := cr.rigBeadStores()
 	assignedWorkBeads := result.AssignedWorkBeads
-	if released := releaseOrphanedPoolAssignments(store, cr.cfg, sessionBeads.Open(), assignedWorkBeads, result.AssignedWorkStores, rigStores); len(released) > 0 {
+	released := releaseOrphanedPoolAssignmentsWhenSnapshotsComplete(store, cr.cfg, sessionBeads.Open(), result, rigStores)
+	if len(released) > 0 {
 		for _, r := range released {
 			fmt.Fprintf(cr.stderr, "released orphaned pool work: %s\n", r.ID) //nolint:errcheck
 		}
@@ -1222,9 +1238,11 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		desiredState,
 		cr.cfg,
 		cr.sp,
-		result.StoreQueryPartial,
+		result.snapshotQueryPartial(),
 	) > 0 {
-		sessionBeads = cr.loadSessionBeadSnapshot()
+		var sessionQueryPartial bool
+		sessionBeads, sessionQueryPartial = cr.loadSessionBeadSnapshotWithPartial()
+		result.SessionQueryPartial = result.SessionQueryPartial || sessionQueryPartial
 	}
 	open := sessionBeads.Open()
 
@@ -1290,13 +1308,15 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 			})
 		}
 		trace.RecordCycleInputSnapshot(map[string]any{
-			"desired_session_count": len(desiredState),
-			"open_session_count":    len(open),
-			"scale_check_counts":    result.ScaleCheckCounts,
-			"pool_desired":          poolDesired,
-			"ready_wait_count":      len(readyWaitSet),
-			"work_set_count":        len(workSet),
-			"store_query_partial":   result.StoreQueryPartial,
+			"desired_session_count":  len(desiredState),
+			"open_session_count":     len(open),
+			"scale_check_counts":     result.ScaleCheckCounts,
+			"pool_desired":           poolDesired,
+			"ready_wait_count":       len(readyWaitSet),
+			"work_set_count":         len(workSet),
+			"store_query_partial":    result.StoreQueryPartial,
+			"session_query_partial":  result.SessionQueryPartial,
+			"snapshot_query_partial": result.snapshotQueryPartial(),
 		})
 		for _, agent := range cr.cfg.Agents {
 			template := agent.QualifiedName()
@@ -1327,7 +1347,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		ctx, cr.cityPath, open, desiredState, cfgNames, cr.cfg, cr.sp, store,
 		cr.dops,
 		assignedWorkBeads, rigStores, readyWaitSet, cr.sessionDrains, poolDesired,
-		result.StoreQueryPartial,
+		result.snapshotQueryPartial(),
 		workSet, cityName,
 		cr.it, clock.Real{}, cr.rec, cr.cfg.Session.StartupTimeoutDuration(),
 		cr.cfg.Daemon.DriftDrainTimeoutDuration(),
@@ -1674,16 +1694,21 @@ func (cr *CityRuntime) rigBeadStores() map[string]beads.Store {
 }
 
 func (cr *CityRuntime) loadSessionBeadSnapshot() *sessionBeadSnapshot {
+	sessionBeads, _ := cr.loadSessionBeadSnapshotWithPartial()
+	return sessionBeads
+}
+
+func (cr *CityRuntime) loadSessionBeadSnapshotWithPartial() (*sessionBeadSnapshot, bool) {
 	store := cr.cityBeadStore()
 	if store == nil {
-		return nil
+		return nil, false
 	}
 	sessionBeads, err := loadSessionBeadSnapshot(store)
 	if err != nil {
 		fmt.Fprintf(cr.stderr, "%s: loading session beads: %v\n", cr.logPrefix, err) //nolint:errcheck
-		return nil
+		return nil, true
 	}
-	return sessionBeads
+	return sessionBeads, false
 }
 
 func filterSessionBeadsByName(snapshot *sessionBeadSnapshot, names map[string]bool) []beads.Bead {
