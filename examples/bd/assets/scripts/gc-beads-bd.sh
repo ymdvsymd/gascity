@@ -85,7 +85,7 @@ tcp_check_port() {
     local host
     host=$(connect_host)
     if command -v nc >/dev/null 2>&1; then
-        nc -z -w2 "$host" "$port" 2>/dev/null
+        nc -z -w 2 "$host" "$port" 2>/dev/null
     elif command -v bash >/dev/null 2>&1; then
         bash -c "echo >/dev/tcp/$host/$port" 2>/dev/null
     else
@@ -295,6 +295,17 @@ database_exists() {
     server_sql "USE \`$db\`" >/dev/null 2>&1
 }
 
+database_has_beads_schema() {
+    local db="$1"
+    [ -n "$db" ] || return 1
+
+    if ! valid_sql_name "$db"; then
+        return 1
+    fi
+
+    server_sql "SELECT 1 FROM \`$db\`.issues LIMIT 1" >/dev/null 2>&1
+}
+
 read_existing_dolt_database() {
     local meta_file="$1"
     [ -f "$meta_file" ] || return 0
@@ -414,6 +425,28 @@ wait_for_bd_runtime_schema() {
     done
 
     return 1
+}
+
+# ensure_types_custom_in_yaml writes types.custom to .beads/config.yaml when
+# the key is absent. bd reads this YAML key as a fallback when the database
+# config table is unset (see beads internal/config: GetCustomTypesFromYAML),
+# so writing here registers the types without paying bd's per-command
+# auto-migrate cost (~50s on populated databases). Idempotent: re-running
+# never appends duplicates.
+ensure_types_custom_in_yaml() {
+    local dir="$1"
+    local types="$2"
+    local config_yaml="$dir/.beads/config.yaml"
+    [ -f "$config_yaml" ] || return 0
+    [ -n "$types" ] || return 0
+    if grep -q "^types\.custom:" "$config_yaml" 2>/dev/null; then
+        return 0
+    fi
+    local tmp
+    tmp=$(mktemp "$config_yaml.tmp.XXXXXX") || return 0
+    cat "$config_yaml" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    printf 'types.custom: %s\n' "$types" >> "$tmp"
+    mv -f "$tmp" "$config_yaml" || rm -f "$tmp"
 }
 
 # --- Robustness Helpers ---
@@ -754,6 +787,66 @@ has_deleted_data_inodes() {
     if command -v lsof >/dev/null 2>&1; then
         local abs_data
         abs_data=$(canonical_dir "$DATA_DIR")
+        if run_lsof -a -p "$pid" +L1 -Fnk 2>/dev/null | awk -v data_dir="$DATA_DIR" -v abs_data="$abs_data" '
+            function normalize(path) {
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", path)
+                if (path == "/private/tmp") {
+                    return "/tmp"
+                }
+                if (substr(path, 1, 13) == "/private/tmp/") {
+                    return "/tmp/" substr(path, 14)
+                }
+                if (path == "/private/var") {
+                    return "/var"
+                }
+                if (substr(path, 1, 13) == "/private/var/") {
+                    return "/var/" substr(path, 14)
+                }
+                return path
+            }
+            function within(path, root) {
+                path = normalize(path)
+                root = normalize(root)
+                return path == root || substr(path, 1, length(root) + 1) == root "/"
+            }
+            function within_data(path) {
+                return within(path, data_dir) || within(path, abs_data)
+            }
+            function flush() {
+                if (name != "" && deleted && within_data(name)) {
+                    found = 1
+                }
+                name = ""
+                deleted = 0
+            }
+            substr($0, 1, 1) == "f" {
+                flush()
+                next
+            }
+            substr($0, 1, 1) == "k" {
+                if (substr($0, 2) == "0") {
+                    deleted = 1
+                }
+                next
+            }
+            substr($0, 1, 1) == "n" {
+                if (name != "") {
+                    flush()
+                }
+                name = substr($0, 2)
+                if (name ~ / \(deleted\)$/) {
+                    deleted = 1
+                    sub(/ \(deleted\)$/, "", name)
+                }
+                next
+            }
+            END {
+                flush()
+                exit(found ? 0 : 1)
+            }
+        '; then
+            return 0
+        fi
         if run_lsof -p "$pid" 2>/dev/null | grep ' (deleted)' | grep -F -e "$DATA_DIR" -e "$abs_data" >/dev/null 2>&1; then
             return 0
         fi
@@ -1045,11 +1138,11 @@ wait_for_managed_pid_ready() {
         if ! kill -0 "$pid" 2>/dev/null; then
             return 1
         fi
-        if [ "$check_deleted" = "true" ] && wait_deleted_data_inodes "$pid"; then
+        if [ "$check_deleted" = "true" ] && has_deleted_data_inodes "$pid"; then
             return 1
         fi
         if tcp_check_port "$port" && do_query_probe; then
-            if [ "$check_deleted" = "true" ] && wait_deleted_data_inodes "$pid"; then
+            if [ "$check_deleted" = "true" ] && has_deleted_data_inodes "$pid"; then
                 return 1
             fi
             return 0
@@ -1897,9 +1990,10 @@ op_init() {
     # beads with that type — must match doctor.RequiredCustomTypes.
     local custom_types="${GC_BEADS_CUSTOM_TYPES:-molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence}"
 
-    # If already initialized on disk, ensure the database is also registered
-    # with the running server. This covers the case where bd init created the
-    # directory but the server was restarted (or the database was quarantined).
+    # If already initialized on disk and the server has a bd schema, ensure the
+    # database is also registered with the running server. Local metadata can be
+    # written before bd init seeds tables, so require the server-side schema
+    # before taking the fast path.
     if [ -f "$dir/.beads/metadata.json" ]; then
         if ensure_database_registered "$dolt_database"; then
             if bd_runtime_schema_ready "$dolt_database"; then
@@ -1908,7 +2002,7 @@ op_init() {
                 # and bd-specific bootstrap only.
                 ensure_beads_dir_permissions "$dir"
                 normalize_scope_after_init "$dir" "$prefix" "$dolt_database"
-                run_bd_pinned "$dir" config set types.custom "$custom_types" 2>/dev/null || true
+                ensure_types_custom_in_yaml "$dir" "$custom_types"
                 ensure_bd_runtime_custom_types "$dolt_database" "$custom_types"
                 ensure_bd_runtime_issue_prefix "$dolt_database" "$prefix"
                 backfill_project_id_if_missing "$dir"
@@ -1961,8 +2055,9 @@ op_init() {
         die "bd schema not visible for $dolt_database after init"
     fi
 
-    # Configure custom bead types (required since beads v0.46.0).
-    run_bd_pinned "$dir" config set types.custom "$custom_types" 2>/dev/null || true
+    # Configure custom bead types without invoking `bd config set`, which can
+    # spend tens of seconds in auto-migrate on populated stores.
+    ensure_types_custom_in_yaml "$dir" "$custom_types"
     ensure_bd_runtime_custom_types "$dolt_database" "$custom_types"
 
     # Keep bd's runtime config in sync with GC's canonical prefix. This is
@@ -2280,7 +2375,7 @@ case "$op" in
     start)        op_start ;;
     ensure-ready) op_ensure_ready ;;
     init)         op_init "$@" ;;
-    create|get|update|close|list|ready|children|list-by-label|set-metadata|delete|dep-add|dep-remove|dep-list)
+    create|get|update|close|reopen|list|ready|children|list-by-label|set-metadata|delete|dep-add|dep-remove|dep-list)
                   op_store_bridge "$op" "$@" ;;
     health)       op_health ;;
     probe)        op_probe ;;

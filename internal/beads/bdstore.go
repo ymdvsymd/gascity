@@ -329,6 +329,42 @@ type bdIssueDep struct {
 	DependencyType string `json:"dependency_type"`
 }
 
+// PartialResultError indicates that a list-style bd command returned at least
+// one usable entry but also included entries that failed to parse. The
+// successful entries are still returned alongside this error; callers that can
+// surface partial data may proceed with those rows, while callers that require
+// a complete picture should treat this as a hard failure.
+type PartialResultError struct {
+	// Op identifies the bd subcommand that produced the partial result
+	// (e.g. "bd list", "bd ready").
+	Op string
+	// Err wraps the joined per-entry parse errors from parseIssuesTolerant.
+	Err error
+}
+
+// Error reports the operation and underlying parse failures.
+func (e *PartialResultError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%s: %v", e.Op, e.Err)
+}
+
+// Unwrap returns the joined parse error so errors.Is / errors.As traversal
+// continues into the underlying causes.
+func (e *PartialResultError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// IsPartialResult reports whether err wraps a PartialResultError.
+func IsPartialResult(err error) bool {
+	var partial *PartialResultError
+	return errors.As(err, &partial)
+}
+
 // parseIssuesTolerant unmarshals a JSON array of bdIssue objects, skipping
 // any entries that fail to parse (e.g. corrupt metadata with non-string values).
 // This prevents a single bad bead from breaking all list operations.
@@ -668,7 +704,7 @@ func (s *BdStore) CloseAll(ids []string, metadata map[string]string) (int, error
 	}
 
 	// Batch close: bd close id1 id2 id3 ...
-	args := append([]string{"close", "--json"}, ids...)
+	args := append([]string{"close", "--force", "--json"}, ids...)
 	_, err := s.runner(s.dir, "bd", args...)
 	if err != nil {
 		// Fall back to individual closes on batch failure.
@@ -692,7 +728,7 @@ func (s *BdStore) CloseAll(ids []string, metadata map[string]string) (int, error
 // Close sets a bead's status to closed via bd close.
 // Idempotent: closing an already-closed bead returns nil.
 func (s *BdStore) Close(id string) error {
-	_, err := s.runner(s.dir, "bd", "close", "--json", id)
+	_, err := s.runner(s.dir, "bd", "close", "--force", "--json", id)
 	if err != nil {
 		// Some bd error paths collapse to a bare exit status without a helpful
 		// not-found string. Re-read the bead to distinguish "already closed" from
@@ -703,6 +739,18 @@ func (s *BdStore) Close(id string) error {
 			return fmt.Errorf("closing bead %q: %w", id, ErrNotFound)
 		}
 		return fmt.Errorf("closing bead %q: %w", id, err)
+	}
+	return nil
+}
+
+// Reopen sets a closed bead's status to open via bd reopen.
+func (s *BdStore) Reopen(id string) error {
+	_, err := s.runner(s.dir, "bd", "reopen", "--json", id)
+	if err != nil {
+		if isBdNotFound(err) {
+			return fmt.Errorf("reopening bead %q: %w", id, ErrNotFound)
+		}
+		return fmt.Errorf("reopening bead %q: %w", id, err)
 	}
 	return nil
 }
@@ -774,10 +822,15 @@ func (s *BdStore) List(query ListQuery) ([]Bead, error) {
 	}
 	filtered := applyListQuery(result, query)
 	if parseErr != nil {
-		if len(filtered) > 0 {
-			return filtered, nil
+		if len(filtered) == 0 {
+			return nil, fmt.Errorf("bd list: %w", parseErr)
 		}
-		return filtered, fmt.Errorf("bd list: %w", parseErr)
+		// Surface partial-parse outcomes so callers can distinguish a complete
+		// list from one that silently dropped entries. Treating a partial list
+		// as authoritative has driven a runaway cache-reconcile loop in the
+		// past (synthesizing bead.closed for beads that were merely dropped
+		// by parseIssuesTolerant).
+		return filtered, &PartialResultError{Op: "bd list", Err: parseErr}
 	}
 	return filtered, nil
 }
@@ -852,10 +905,10 @@ func (s *BdStore) Ready() ([]Bead, error) {
 		result = append(result, bead)
 	}
 	if parseErr != nil {
-		if len(result) > 0 {
-			return result, nil
+		if len(result) == 0 {
+			return nil, fmt.Errorf("bd ready: %w", parseErr)
 		}
-		return result, fmt.Errorf("bd ready: %w", parseErr)
+		return result, &PartialResultError{Op: "bd ready", Err: parseErr}
 	}
 	return result, nil
 }
