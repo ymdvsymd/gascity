@@ -645,7 +645,7 @@ func (sm *SupervisorMux) humaHandleEventList(_ context.Context, input *Superviso
 }
 
 func supervisorEventListFilterIsEmpty(filter events.Filter) bool {
-	return filter.Type == "" && filter.Actor == "" && filter.Since.IsZero() && filter.AfterSeq == 0
+	return filter == (events.Filter{})
 }
 
 func (sm *SupervisorMux) currentSupervisorEventTotal() int {
@@ -749,6 +749,7 @@ func (sm *SupervisorMux) streamGlobalEvents(hctx huma.Context, input *Supervisor
 		return
 	}
 	defer mw.Close() //nolint:errcheck
+	flushSSEHeaders(hctx)
 
 	keepalive := time.NewTicker(sseKeepalive)
 	defer keepalive.Stop()
