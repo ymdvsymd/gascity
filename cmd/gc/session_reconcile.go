@@ -28,7 +28,10 @@ import (
 )
 
 type wakeEvaluation struct {
-	Reasons          []WakeReason
+	Reasons []WakeReason
+	// Reason mirrors AwakeDecision.Reason on the ComputeAwakeSet bridge path.
+	// It is only actionable when Reasons contains the matching effective wake.
+	Reason           string
 	Policy           resolvedSessionSleepPolicy
 	ConfigSuppressed bool
 }
@@ -605,11 +608,12 @@ func recordRateLimitQuarantine(session *beads.Bead, store beads.Store, clk clock
 	}
 	qUntil := clk.Now().Add(defaultRateLimitQuarantineDuration).UTC().Format(time.RFC3339)
 	batch := map[string]string{
-		"state":                string(sessionpkg.StateAsleep),
-		"quarantined_until":    qUntil,
-		"sleep_reason":         "rate_limit",
-		"last_woke_at":         "",
-		"pending_create_claim": "",
+		"state":                     string(sessionpkg.StateAsleep),
+		"quarantined_until":         qUntil,
+		"sleep_reason":              "rate_limit",
+		"last_woke_at":              "",
+		"pending_create_claim":      "",
+		"pending_create_started_at": "",
 	}
 	if err := store.SetMetadataBatch(session.ID, batch); err != nil {
 		fmt.Fprintf(os.Stderr, "recordRateLimitQuarantine: SetMetadataBatch %s: %v\n", session.ID, err) //nolint:errcheck
@@ -967,6 +971,17 @@ func staleCreatingState(session beads.Bead, clk clock.Clock) bool {
 		return false
 	}
 	if strings.TrimSpace(session.Metadata["state"]) != string(sessionpkg.StateCreating) {
+		return false
+	}
+	return pendingCreateAttemptStale(session, clk)
+}
+
+// pendingCreateAttemptStale reports whether the current pending-create attempt
+// has aged past staleCreatingStateTimeout, regardless of the bead's current
+// projected state. This lets the reconciler keep never-started pending-create
+// leases alive after healState has already rewritten state=creating to asleep.
+func pendingCreateAttemptStale(session beads.Bead, clk clock.Clock) bool {
+	if clk == nil {
 		return false
 	}
 	now := clk.Now()
