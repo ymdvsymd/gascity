@@ -2,8 +2,8 @@
 
 このドキュメントは、Gas City (`gc`) が controller と AI CLI のやりとりをどう抽象化しているか (= session provider 層) と、その抽象を踏まえて本番サーバ (EC2 等) でどう運用するかを、実装ベースで整理したものです。
 
-> 調査時点: 2026-04-30 / 対象: `main` ブランチ HEAD
-> 関連実装: `internal/runtime/`, `contrib/k8s/`, `cmd/gc/cmd_supervisor.go`, `cmd/gc/providers.go`
+> 調査時点: 2026-05-13 / 対象: `main` ブランチ HEAD
+> 関連実装: `internal/runtime/`, `contrib/k8s/`, `cmd/gc/cmd_supervisor.go`, `cmd/gc/providers.go`, `cmd/gc/session_lifecycle_parallel.go`（段階モデル）, `internal/reconciler/`（named-always / pool alias）
 > 関連ドキュメント: `engdocs/design/machine-wide-supervisor-v0.md`, `engdocs/design/api-ops-design.md`
 
 ---
@@ -13,6 +13,7 @@
 - **session provider** (§1) = controller ⇄ AI CLI プロセス間の transport を抽象化したもの。`Start` / `SendKeys` / `Nudge` / `Peek` / `Stop` の 5 操作だけが controller から見える境界。
 - **AI CLI provider** (`[providers.claude]` で定義する claude / codex / gemini 等) と **session provider** (`[session] provider = "tmux"`) は **直交した 2 軸**。同じ claude を tmux でも k8s でも動かせる。
 - 実装は 7 種類: **tmux** (default) / **subprocess** / **acp** / **k8s** / **exec:\<script\>** / **hybrid** / **auto** (内部 wrapper) と、テスト用の **fake** / **fail** (§3)。
+- **session lifecycle の段階** (§3.9) は `start_call` / `state_sync_recovery` / `post_start_observe` / `commit_refresh` の 4 段に分かれる (2026-05-11, #1944)。どこで時間を食ったかが lifecycle log で読める。
 - **外部 supervisor** (§4) = OS / クラスタ ⇄ gc プロセスの lifecycle を抽象化したもの。systemd と K8s が代表的な具象。session provider (§1) との **2 軸の組み合わせ**としてデプロイを設計する。
 - 本番運用は 3 経路 (§5):
   - **§5.2 K8s 経路** — `contrib/k8s/` がフル整備、`gc-controller-k8s deploy` で完結。50+ agent / 複数 city / テナント分離向け。
@@ -20,6 +21,7 @@
   - **§5.4 単一 VM + ACP + systemd 経路** — claude / opencode 統一なら構造化対話で server らしい構造。tmux と systemd unit は共有。
 - どの経路も **API 認証は未実装**。外部公開すると read-only に自動降格 (`internal/api/middleware.go:130-155`)。前段プロキシ + IdP は自前で塞ぐ前提。
 - **観測と介入** (§5.5): tmux/k8s は `gc attach` で TTY 介入可能、ACP は TTY 不可だが events stream + nudge / mail / interrupt の組み合わせで代替。
+- **復元と reconciler** (§5.5.6 / 2026-05-13 時点): `resume_flag` が空でも fresh start で retry (#2035)、named-always が `configured_named_identity` 欠落でも runtime-name fallback で起こす (#2034)、pool 内 alias でも assignment を「live」と認識して dual-claim を防ぐ (#1982)。
 - **ACP プロトコル仕様**そのものは付録 A に独立解説。
 
 ---
@@ -192,6 +194,31 @@ func (p *Provider) route(name string) runtime.Provider {
 ### 3.8 `fake` / `fail`
 
 テスト専用 (`internal/runtime/fake.go`)。本番では使わない。`fake` は全操作が成功、`fail` は全操作がエラー。
+
+### 3.9 session lifecycle の段階モデル（2026-05-11 / #1944）
+
+session provider の選択によらず、`gc session new` や reconciler 経由で session が立ち上がる際の所要時間は、内部では **4 つの sub-phase** に分けて計測されています。`cmd/gc/session_lifecycle_parallel.go:204-213` が lifecycle log にこの内訳を出します。`gc session list` の出力や `gc events stream` でも `phases=[…]` フィールドとして観測できます。
+
+| phase | 担当している処理 | いつ時間を食うか |
+|---|---|---|
+| `start_call` | `startPreparedStartCandidate` の総時間（provider の `Start` + ErrStateSync recovery を内包） | session provider の Start 自体が遅いとき / state-sync recovery を踏んだとき |
+| `state_sync_recovery` | `workerSessionTargetRunningWithConfig` の recovery 経路 | err が `ErrStateSync` だったとき**のみ**発火。tmux/k8s の状態が乱れて wedged な runtime を診断 API で reconcile した時間 |
+| `post_start_observe` | Start 完了後の readiness 観測（ready-prompt の確認や handshake 完了待ちなど） | provider 別の起動時 dialog や ACP handshake が長引いたとき |
+| `commit_refresh` | bead 側のメタデータ書き戻し（assignee / instance_token / 起動時刻の永続化） | beads の write が詰まったとき |
+
+なぜ細分化されているか:
+
+- 以前は `start_call=Xs` の単一値しか出ず、「provider の起動が遅い」のか「state-sync で reconcile を踏んだ」のかが lifecycle log から区別できなかった。
+- `state_sync_recovery` だけ別計上することで、wedged な runtime を診断 API で叩く特殊経路の所要時間が支配的になっているケース（slow start のかなりの割合）を可視化できる。
+
+実用上の見方:
+
+- **`start_call` だけ大きい**: provider の Start 自体（tmux `new-session` / k8s Pod 起動 / ACP handshake）が遅い。tmux なら socket 競合、k8s なら image pull・scheduling、ACP なら handshake_timeout を確認。
+- **`state_sync_recovery` が大きい**: 直前の controller が異常終了して runtime が wedged、診断 API での reconcile を踏んでいる。`gc trace` での artifact 採取候補。
+- **`post_start_observe` が大きい**: provider profile の `ready_prompt_prefix` が出ない / ACP `initialized` notification が来ない。CLI のバージョン差やプロンプト変更を疑う。
+- **`commit_refresh` が大きい**: beads の write が詰まっている。dolt sql-server の負荷を確認。
+
+phase 名はそのまま「どの場所のコードを読むか」のラベルにもなっているので、incident response 時はこの 4 つで切り分けると `internal/session/` か `internal/runtime/<provider>/` のどちらに踏み込むか判断しやすい。
 
 ---
 
@@ -892,6 +919,38 @@ ACP の運用ループ
 | events live | `GET /v0/events/stream` (SSE) |
 
 dashboard はこれらをラップした SPA。**ACP 環境では tmux attach が無いぶん、dashboard が運用の主戦場**になる、と理解しておくと使い勝手の設計判断がしやすいです。
+
+#### 5.5.6 session の復元と reconciler の挙動（2026-05-13 時点）
+
+本番 server で controller を入れ替えた直後 / pool agent を回したあと / 既存 session を resume したい場合に、reconciler が「live な session」と「起こすべき session」をどう判定するかが問題になります。2026-04-29 → 2026-05-13 の間に、ここで失敗していた 3 ケースが個別に直っています。運用ループに乗ってくる現実の挙動として記録しておきます。
+
+##### A. `resume_flag` が空でも fresh start で retry（#2035）
+
+provider profile が `resume_flag` を持たない（または `--resume` 相当を空文字に設定している）構成では、stale な key を検出した時に `retryFreshStartAfterStaleKey` が **early return してしまい**、session が古い key path のまま wedged になる挙動が #1655 として再現していました。
+
+現在の挙動: `resume_flag` の値の有無に関係なく **fresh start として retry** します。stale key の検出 → cleanup → provider.Start を、resume を使わずに通常起動として再試行する形に揃った（`internal/session/`、PR #2035, 2026-05-13 マージ）。
+
+運用への影響: cursor / amp / auggie のように resume 概念が provider 側になく、`resume_flag` を空のままにしてある profile でも、stale key を踏んだ session が retry で必ず healthy 状態へ戻る。`gc trace` で `retryFreshStartAfterStaleKey` の return path を追っていたインシデント類は **2026-05-13 以降は再現しないはず**。
+
+##### B. named-always session が `configured_named_identity` 欠落でも起きる（#2034）
+
+`named-always` を使う agent は、reconciler tick ごとに「`configured_named_identity` が runtime config 側に存在しているか」で起こすか判断していました。一度 churn を起こした直後の tick で、まだ runtime config 側の identity 配列が再構築されていないと、起こすべき session を **取りこぼす** ことがあり、これが #1493 として残っていました。
+
+現在の挙動: `configured_named_identity` が missing でも、**runtime-name fallback** で正しく起こす（`internal/reconciler/`、PR #2034, 2026-05-13 マージ）。post-churn の最初の reconcile で identity の再投入が間に合わなくても、runtime 側の session 名で同定できれば起動対象になる。
+
+運用への影響: long-running な named-always agent（mayor や常駐の review agent などの典型構成）を入れている city で、controller の reload / restart 直後に「named session が起きてこない」現象が出にくくなった。`gc session list` で `state=asleep` のまま残っているように見えたら、`gc reload`（または `gc reload --soft`）を打って強制 tick させるのが対症療法。
+
+##### C. pool 内で alias 認識して dual-claim を防ぐ（#1982）
+
+named pool に属する polecat は、外向きの identity として **stable な alias**（例: `cashmaster/gastown.nux`）を晒し、内部では canonical な session name を持ちます。この 2 つは別文字列です。bead の `assignee` 欄に alias 形式が入っている場合、以前の `releaseOrphanedPoolAssignments` と `ComputePoolDesiredStates` は canonical 名でしか照合しなかったため、**生きている polecat の claim を孤児とみなして release**、別の polecat を新規に spawn してしまうことがありました。結果として 1 つの bead に 2 体が claim する dual-claim が発生していました。
+
+現在の挙動: `sessionBeadAssigneeIdentities()` ヘルパが **session 名 + `Metadata["alias"]` + `alias_history`** を全て候補集合として扱い、どれかが一致すれば live と判定する（`internal/pool/`, `internal/reconciler/`、PR #1982, 2026-05-13 マージ）。pool reconciler が live work を孤児扱いしないので、別 polecat の不要な spawn と dual-claim は出なくなった。
+
+運用への影響: alias を多用する named pool（典型的には pack 同梱の cashmaster / gastown の polecat pool）で、`gc city status` で同じ bead に複数 session が刺さっている現象が解消。alias 履歴を持つ polecat を「世代交代」させる運用も安全になった。
+
+##### まとめ
+
+3 件とも reconciler が「自分が持っている state を絶対視せずに、runtime からの情報で補正する」方向の改善で、要点は同じです。**post-restart / post-churn / post-reload の最初の 1-2 tick で session が一時的に消えても、次の tick で自動的に拾い直される**ことが保証されるようになった、と覚えておくと運用の心理的負荷が下がります。逆に言うと、ここで 30s 以上ハングする場合は #1944 の lifecycle phase で `state_sync_recovery` が肥大化しているはずなので、§3.9 の見方で切り分け可能です。
 
 ---
 
