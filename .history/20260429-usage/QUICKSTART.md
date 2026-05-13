@@ -1,6 +1,6 @@
 # Gas City — クイックスタート
 
-**生成日:** 2026-04-29
+**生成日:** 2026-05-13
 **対象バージョン:** gascity v1.0.0+
 **所要時間:** 約 10 分（前提依存のインストール含めず約 5 分）
 
@@ -33,6 +33,8 @@ gc version
 ```
 
 `gc` が `git commit` を起動した場合は Oh My Zsh のエイリアスが先勝ちしている。`command gc version` で一旦バイパスし、後述のトラブルシューティングで恒久対処する。
+
+`brew upgrade gascity` でバイナリを差し替えたあとは、supervisor が古い `gc` を握り続けないよう `gc service restart` を打つか、いずれかの city で `gc start` を打って service ファイルを再生成しておく。詳細は [TROUBLESHOOTING.md#gc-service-restart-が必要なのはいつ](./TROUBLESHOOTING.md#gc-service-restart-が必要なのはいつ) を参照。
 
 dolt や bd を入れたくない（チュートリアル用途で済ませたい）場合は、ファイルベースの beads provider に切り替える:
 
@@ -187,6 +189,7 @@ gc unregister ~/bright-lights
 
 - 日常で使うコマンドを一通り知る → [コマンドリファレンス](./COMMANDS.md)
 - カスタムエージェントを定義したい → [USE-CASES.md#シナリオ-2-カスタムレビュアエージェントを定義する](./USE-CASES.md#シナリオ-2-カスタムレビュアエージェントを定義する)
+- プロンプトを手書きせず LLM に書かせたい → [`gc prompt synth`](./COMMANDS.md#gc-prompt-synth) で role と provider を指定するだけで雛形が生成できる
 - マルチステップワークフローを書きたい → [USE-CASES.md#シナリオ-4-formula-でマルチステップワークフローを書く](./USE-CASES.md#シナリオ-4-formula-でマルチステップワークフローを書く)
 - 定期実行を仕込みたい → [USE-CASES.md#シナリオ-5-order-で定期ジョブを仕込む](./USE-CASES.md#シナリオ-5-order-で定期ジョブを仕込む)
 - 詳細設定を理解したい → [設定ガイド](./CONFIGURATION.md)

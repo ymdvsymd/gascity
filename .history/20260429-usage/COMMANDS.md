@@ -1,6 +1,6 @@
 # Gas City — コマンドリファレンス
 
-**生成日:** 2026-04-29
+**生成日:** 2026-05-13
 **対象バージョン:** gascity v1.0.0+
 
 `gc` はトップレベル CLI で、Cobra ベース。`gc help <command>` で各コマンドの詳細ヘルプが見られる。すべてのコマンドは「現在のディレクトリから city を発見する」ロジックを共通で持ち、`--city <path>` または `--rig <name|path>` で明示できる。`GC_CITY` / `GC_CITY_PATH` / `GC_RIG` 環境変数も同じ目的に使える。
@@ -14,7 +14,7 @@
 | ライフサイクル | `init` `start` `stop` `restart` `reload` `status` `suspend` `resume` | city の作成・起動・停止 |
 | supervisor / service | `supervisor` `service` `register` `unregister` `cities` | マシン全体の管理プロセス |
 | ワークルーティング | `sling` `hook` `prime` `handoff` `bd` `beads` `wait` | bead 作成と配送 |
-| エージェント | `agent` `rig` `pack` `import` | 構成定義 |
+| エージェント | `agent` `prompt` `rig` `pack` `import` | 構成定義 |
 | セッション | `session` | tmux の会話セッション管理 |
 | 通信 | `mail` `nudge` `event` `events` | エージェント間メッセージ・イベント |
 | フォーミュラ・オーダー | `formula` `order` `convoy` `wisp` `converge` | 宣言的ワークフロー |
@@ -65,6 +65,14 @@ city 全体を再起動。設定変更を controller に反映させたいが `g
 ### `gc reload [path]`
 
 controller を再起動せずに `city.toml`・`pack.toml`・`agents/*/agent.toml` を再読み込みさせる。エラーがあれば古い構成を保持したまま失敗を報告する。日常的な構成変更はこちらで十分。
+
+主要フラグ:
+
+| フラグ | 説明 |
+|-------|------|
+| `--async` | 結果を待たずに返る |
+| `--soft` | config drift を許容して走っている session を drain しない。`.gc/settings.json` の編集や、エージェントの作業を止めたくない設定変更に向く |
+| `--timeout <dur>` | 同期実行時の応答待ちタイムアウト |
 
 ### `gc status [name]`
 
@@ -216,6 +224,40 @@ beads provider 自体の操作。
 | `--provider <name>` | provider を上書き（city デフォルトと違う場合） |
 
 スキャフォールド後、`agents/<name>/prompt.template.md` を編集してプロンプトを書き、必要に応じて `agents/<name>/agent.toml` で `provider` や `dir`、`option_defaults` を上書きする。
+
+### `gc prompt`
+
+LLM を使ってエージェントのプロンプトテンプレートを生成するサブグループ。2026-04-29 以降に追加された。
+
+| サブコマンド | 役割 |
+|-------------|------|
+| `gc prompt synth --role <name>` | meta-prompt を介して当該役割の `prompt.template.md` を LLM に書かせる |
+
+`gc prompt synth` の主要フラグ:
+
+| フラグ | 説明 |
+|-------|------|
+| `--role <name>` | 生成対象の役割名（必須） |
+| `--provider <key>` | 生成に使う provider（city デフォルトを上書き） |
+| `--rig <name>` | rig スコープで生成する場合の rig 名 |
+| `--write` | 生成結果を `agents/<role>/prompt.template.md` に書き込む |
+| `--force` | 既存ファイルがあっても上書きする |
+| `--writer-agent <name>` | 別エージェント経由で生成（`mol-prompt-synth` molecule を slingue する Slingued モード） |
+| `--wait` | Slingued モードで完了を待つ |
+| `--wait-timeout <dur>` | 待ち合わせの上限 |
+| `--meta-prompt <path>` | 既定の meta-prompt の代わりに使うファイルを指定 |
+
+直接モード（既定）は LLM を 1 回呼んで結果を標準出力に流す（`--write` でファイルに書き出す）。Slingued モードは既存のエージェント（例えば mayor）に生成作業を委譲する形で、長尺の生成や別 provider を使った生成に向く。
+
+例:
+
+```bash
+# claude で reviewer 用のテンプレを生成してファイルに書き出す
+gc prompt synth --role reviewer --provider claude --write
+
+# mayor に作業を投げて完了まで待つ
+gc prompt synth --role tester --provider codex --writer-agent mayor --wait
+```
 
 ### `gc rig`
 
