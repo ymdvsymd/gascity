@@ -126,18 +126,24 @@ gc start <city-path>
 
 それでも起動しない場合は `gc doctor --verbose` でランタイム診断。`.gc/logs/` 配下の controller ログも確認する。
 
-### `gc city status` や `gc hook` が大規模 bead 集合で固まる / `partial snapshot due to deadline` が出る
+### `gc city status` や `gc hook` が大規模 bead 集合で固まる / 「loading session snapshot timed out after …」が stderr に出る
 
-**現象:** 10,000 件級の bead を抱える city で `gc city status` や `gc hook` を打つと応答が極端に遅い、あるいは `partial snapshot due to deadline` という警告が出力結果に混ざる。
+**現象:** 10,000 件級の bead を抱える city で `gc city status` や `gc hook` を打つと応答が極端に遅い、あるいは stderr に次のような警告が混ざる。
 
-**原因:** これらのコマンドは city 全体を 1 回 scan して状態を集める設計だが、bead 数が桁違いに増えると I/O が膨らんで budget を超える。2026-04-29 以降は bounded scan が入り、budget 超過時は途中までの結果に `partial snapshot due to deadline` を付けて返すようになった（ハングではなく早期返却）。
+```
+gc status: loading session snapshot timed out after 3s; continuing with runtime-only status
+```
+
+（実装は `cmd/gc/cmd_citystatus.go:196` で `statusSessionSnapshotTimeout` 3 秒超過時に上記を出す。PR の解説では「partial snapshot due to deadline」という言い回しで紹介されたが、ユーザに見える実際の文言は上記。）
+
+**原因:** これらのコマンドは city 全体を 1 回 scan して状態を集める設計だが、bead 数が桁違いに増えると I/O が膨らんで budget を超える。PR #2005（2026-05-13 マージ）で `cmd_citystatus.go` / `cmd_hook.go` / `doctor_routed_to_checks.go` / `doctor_session_model.go` に bounded scan が入り、budget 超過時は途中までの状態（runtime 観測だけ）で返り、上記の timeout 警告を stderr に出すようになった（ハングではなく早期返却）。
 
 **対処:**
 
-- 警告が出ている時点で得られた結果は「完全ではないが現時点で見えた範囲」と読む。
+- 警告が出ている時点で得られた結果は「完全ではないが runtime から観測できた範囲」と読む。bead 由来の情報（active sessions / suspended の集計など）は欠落しうる。
 - 古い bead を整理する: `bd compact` で長期 closed bead を semantic summary に畳む、`bd close` し忘れている残骸を一括 close する。
 - 必要な情報が一部しか出ない場合は `bd ready --limit N` のように対象を絞った beads CLI を直接使う。
-- 詳細調査は `gc trace` と `engdocs/contributors/reconciler-debugging.md` に従う。
+- `statusObservationTimeout`（750ms）と `statusSessionSnapshotTimeout`（3s）は実装側の変数。大規模 city で恒常的に詰まる場合は `gc trace` 採取の上、`engdocs/contributors/reconciler-debugging.md` に従って upstream に報告。
 
 ### city が壊れている / `.gc/` 配下が破損
 
