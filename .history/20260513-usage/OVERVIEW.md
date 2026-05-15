@@ -25,7 +25,94 @@ Gas City は、Steve Yegge の Gas Town プロジェクトから抽出されたS
 
 ---
 
-## 2. 物理構成 — まず実体を見る
+## 2. 主要な概念
+
+Gas City は「**city** という作業環境の中に、複数の **rig**（対象プロジェクト）と複数の **agent**（エージェント）を登録して動かす」というモデルで構成されている。SDK の振る舞いは、この 5 つの基本用語をどう組み合わせるかで決まる。
+
+### 5 つの基本用語
+
+| 概念 | 何か | 物理的な実体 | 例 |
+|------|------|------------|----|
+| **provider** | AI コーディング CLI そのもの | `claude`、`codex`、`gemini` などの実行ファイル | Claude Code、Codex、Gemini、Cursor、Amp |
+| **agent** | 振る舞いを与えた「役割の定義」 | `pack.toml` の `[[agent]]` ＋ `agents/<名前>/prompt.template.md`（任意で `agent.toml` で個別上書き） | mayor、polecat、coder |
+| **rig** | エージェントが実際にコードを書く対象プロジェクト | 別ディレクトリ（git 初期化済み）。`gc rig add` で city に登録され、独立した bead store と一意の ID プレフィックスを持つ | `~/hello-world`、`~/my-app` |
+| **city** | オーケストレーション環境一式を入れたディレクトリ | `pack.toml` ＋ `city.toml` ＋ `agents/` ＋ `.gc/` を含む親ディレクトリ。マシン全体の supervisor に登録される最上位単位 | `~/bright-lights` |
+| **pack** | 再利用可能な役割定義のセット | `pack.toml` と `agents/` の組。city に直接同梱するか、`[imports.<name>]` で外部から取り込む | `examples/gastown/`、`examples/swarm/` |
+
+**bead**（永続化される作業単位）は、これら 5 つとは別の軸の概念で、§4 で詳しく扱う。本節ではまず「役割をどこに置き、どの対象プロジェクトに対して、どの CLI で動かすか」というレイアウトの 5 用語を押さえる。
+
+### 関係性
+
+`city` は `pack` を 1 つ以上抱え（`pack.toml` で直接定義するか、`[imports.<name>]` で外部から取り込む）、複数の `rig` を登録する。`agent` は city または rig にスコープされ、起動時に `provider`（CLI）を選ぶ。
+
+```mermaid
+graph TB
+    subgraph CityDir["city（最上位の作業環境）"]
+        PackTOML["pack.toml + agents/<br>役割定義（pack）"]
+        CityTOML["city.toml<br>このマシンのデプロイ設定"]
+        SiteTOML[".gc/site.toml<br>マシン固有のパス紐付け"]
+    end
+    subgraph AgentScope["agent（city or rig にスコープ）"]
+        CityAgent["city スコープ<br>例: mayor"]
+        RigAgent["rig スコープ<br>例: polecat / coder"]
+    end
+    subgraph RigDirs["rigs（対象プロジェクト、city とは別の場所）"]
+        Rig1["~/hello-world<br>bead prefix: hw-"]
+        Rig2["~/my-app<br>bead prefix: my-"]
+    end
+    Provider["provider CLI<br>claude / codex / gemini / ..."]
+    PackTOML -.->|定義| AgentScope
+    CityTOML -->|登録| RigDirs
+    SiteTOML -.->|実パスに紐付け| RigDirs
+    CityAgent -->|起動時に選ぶ| Provider
+    RigAgent -->|起動時に選ぶ| Provider
+    RigAgent -->|作業対象| Rig1
+    RigAgent -->|作業対象| Rig2
+```
+
+### city と rig の使い分け
+
+- **city スコープのエージェント** — city 全体に 1 体だけ存在する。`pack.toml` の `[[agent]]` で `dir` を**指定しない**もの。city 全体を俯瞰する立場（慣習的には mayor）に充てる。
+- **rig スコープのエージェント** — `[[agent]]` で `dir = "<rig 名>"` を指定したもの。rig ごとに複製され、その rig のコードを書く立場（慣習的には polecat、coder、committer）に充てる。
+
+各 rig は独立した bead store と一意の ID プレフィックス（例: `hello-world` → `hw-`）を持つ。複数 rig が同居しても作業記録が混ざらないのは、この prefix と bead store の分離による。`gc sling hello-world/claude "..."` のように `<rig>/<provider>` の形で実行先を指定するのは、この分離があるためである。
+
+### 物理ディレクトリの典型例
+
+[QUICKSTART.md](./QUICKSTART.md) の手順で `~/bright-lights` という city を作り、`~/hello-world` を rig として登録した直後の構造は次のとおり:
+
+```text
+~/bright-lights/              # city ディレクトリ
+├── city.toml                 # このマシンのデプロイ設定（git 管理）
+├── pack.toml                 # 役割定義（移植可能、git 管理）
+├── agents/                   # 各エージェントのプロンプトと設定
+│   ├── mayor/
+│   │   ├── prompt.template.md
+│   │   └── agent.toml
+│   └── polecat/
+│       └── prompt.template.md
+├── formulas/                 # workflow 定義（任意、§5）
+├── orders/                   # 定期・条件発火ジョブ（任意、§7）
+└── .gc/                      # runtime state（git 無視）
+    ├── site.toml             # マシン固有のパス紐付け
+    └── ...
+
+~/hello-world/                # rig ディレクトリ（city とは別の場所）
+├── .git/
+└── ... (実際のコードベース)
+```
+
+`city.toml` の `[[rigs]]` セクションが「city はどの rig を抱えるか」を宣言し、`.gc/site.toml` が「そのマシン上で各 rig がどの絶対パスに居るか」を結びつける。`pack.toml` を別マシンへ持ち出せば、その先で違う rig 配置に再バインドして動かせる — これが「ポータブルな部分（pack）と環境依存（city / site）の分離」の設計意図である。
+
+### 設計上の柱: ZERO hardcoded roles
+
+Gas City のSDK本体（Goコード）には、Mayor・Polecat・Coderなどの役割名が一切登場しない。役割は `pack.toml` と `agents/<名前>/prompt.template.md`（プロンプトのMarkdown）で定義される。SDKは「役割を実行するための土台」だけを提供し、「どんな役割を置くか」はユーザー（または利用するパック）が決める。これが Gas City が単なる Gas Town の再実装ではなく、汎用SDKとして機能する理由である。
+
+mayor / polecat / coder といった具体名はすべて pack の慣習にすぎず、SDK は名前を認識しない。同じ役割名で違う運用にしてもよいし、これらを全部捨てて自分で組んでもよい — それが TOML とプロンプトだけで完結する。
+
+---
+
+## 3. 物理構成 — まず実体を見る
 
 抽象的なモデル（後述するMEOW stackや原始要素）はすべて、この物理構成の上に組み立てられている。
 
@@ -68,20 +155,9 @@ graph TB
 - **bd（beads）** — `dolt` という分散Gitライクな永続ストアの上に作られたCLI。すべての作業記録（後述の bead）はここに保存される。`GC_BEADS=file` を指定すれば、ファイルベースの簡易ストアに切り替えられる。
 - **hook** — 各CLI固有の仕組み（Claude Codeの `settings.json` など）を介して仕込まれる、エージェントの毎ターンの差し込み点。これによりエージェントは、自分宛のメールや新しいタスクの存在に常に気付ける。
 
-ここで、本書を通じて使う基本用語を実体として導入する:
-
-- **bead**（永続化される作業単位） — タスク・メッセージ・セッションなど、作業に関わるあらゆる記録の最小単位。詳しくは§3。
-- **provider**（AIコーディングCLIの総称） — Claude Code、Codex、Gemini、Cursor などの実体。Gas City はこれらを共通のインターフェースで扱う。
-- **rig**（city に登録した外部プロジェクト） — エージェントが実際にコードを書く相手のディレクトリ。Gas City は city の中に複数の rig を登録できる。
-- **city**（一つのオーケストレーション環境） — `pack.toml` と `city.toml`、状態保管用の `.gc/`、エージェント定義の `agents/` を含むディレクトリ全体。
-
-### この章で押さえる設計上の柱: ZERO hardcoded roles
-
-Gas City のSDK本体（Goコード）には、Mayor・Polecat・Coderなどの役割名が一切登場しない。役割は `pack.toml` と `agents/<名前>/prompt.template.md`（プロンプトのMarkdown）で定義される。SDKは「役割を実行するための土台」だけを提供し、「どんな役割を置くか」はユーザー（または利用するパック）が決める。これが Gas City が単なる Gas Town の再実装ではなく、汎用SDKとして機能する理由である。
-
 ---
 
-## 3. 中心思想 — 永続化される作業はすべて bead
+## 4. 中心思想 — 永続化される作業はすべて bead
 
 > "An agent is not a session — an agent _is_ a Bead, an identity with a singleton global address."
 > — Steve Yegge, _Welcome to Gas Town_
@@ -94,11 +170,11 @@ bead の最小定義は単純で、ID・状態・種類（type）と、必要に
 
 ここで一つ釘を刺しておきたい。**「すべては bead」と言うとき、対象は『永続化される作業記録』に限られる**。物理構成（supervisor、controller、tmux）も、設定ファイル（`city.toml`、`pack.toml`）も、Markdownのプロンプトも bead ではない。これらは bead を扱うための土台や材料であって、bead そのものではない。混同すると Gas City の構造が見えなくなるので注意してほしい。
 
-bead の中身（種類とラベルの分類）は§7で扱う。本章では「なぜ bead を中心に置くのか」だけを押さえれば十分である。
+bead の中身（種類とラベルの分類）は §8 で扱う。本章では「なぜ bead を中心に置くのか」だけを押さえれば十分である。
 
 ---
 
-## 4. 作業を表す4層 — MEOW stack
+## 5. 作業を表す4層 — MEOW stack
 
 Gas City は仕事を4層で表現する。MEOW = **Molecular Expression of Work**（分子的な作業表現）。一番上の「設計図」から一番下の「永続レコード」まで、下に行くほど具体的になる段階モデルである。
 
@@ -150,11 +226,11 @@ graph TB
 | 用途 | 長期的・複数エージェント分担の workflow | 親仕事に貼り付ける短命の workflow |
 | 起動コマンド | `gc formula cook`（pour 形式） | `gc sling --formula`、order からの自動発火（vapor 形式） |
 
-MEOW stack の重要な性質は、**この4層がすべて、後述する5つの原始要素（設定・bead store・event bus・agent protocol・prompt templates）の組み合わせで実装できる**ことにある。役割名が Go コードに現れることもなく、すべて TOML とプロンプトで表現される。これが §5 の議論につながる。
+MEOW stack の重要な性質は、**この4層がすべて、後述する5つの原始要素（設定・bead store・event bus・agent protocol・prompt templates）の組み合わせで実装できる**ことにある。役割名が Go コードに現れることもなく、すべて TOML とプロンプトで表現される。これが §6 の議論につながる。
 
 ---
 
-## 5. 構成要素 — 5原始要素と4派生機構
+## 6. 構成要素 — 5原始要素と4派生機構
 
 Gas City は、5つの**原始要素**（これ以上分割できない構成要素）と、それらを組み合わせて作られる4つの**派生機構**（より高水準の仕組み）から成る。原始要素は「これが欠けると Gas Town を再現できない」という最小集合で、派生機構は「原始要素の合成でちゃんと作れる」高水準機能である。
 
@@ -204,7 +280,7 @@ graph TB
 ### 4つの派生機構
 
 - **Messaging（= Agent Protocol + Task Store + Prompt Templates）** — エージェント間メールの正体は、`type = "message"` の bead を1件作ることである。`gc mail send` は内部で `internal/mail/beadmail/` 経由で bead を作るだけ。受信側は次のターンで hook 経由で受信箱を確認し、自分宛のメッセージを context に取り込み、prompt template の手順で読み・返信する。生きているターミナルに直接テキストを流す `gc nudge` は、Agent Protocol の prompt送信を素直に呼ぶ。主に使うコマンドは `gc mail send/inbox/read`、`gc nudge`。
-- **Formulas & Molecules（= Task Store + Config + Prompt Templates）** — formula は Config が TOML から読み込み、molecule は Task Store の中で「root の bead と各手順の子 beads からなる木」として表現され、各手順の中身は担当エージェントの prompt template が埋める。MEOW stack の中段（§4）の実装にあたる。主に使うコマンドは `gc formula list/show/cook`、`gc sling --formula`。
+- **Formulas & Molecules（= Task Store + Config + Prompt Templates）** — formula は Config が TOML から読み込み、molecule は Task Store の中で「root の bead と各手順の子 beads からなる木」として表現され、各手順の中身は担当エージェントの prompt template が埋める。MEOW stack の中段（§5）の実装にあたる。主に使うコマンドは `gc formula list/show/cook`、`gc sling --formula`。
 - **Dispatch / Sling（= Agent Protocol + Task Store + Event Bus + Config + Prompt Templates）** — 「仕事を見つける／作る → prompt template でエージェントを起こして渡す → 関連する beads をまとめる convoy を作る → イベントログに残す」という一連の合成手続き。`gc sling` がこれを駆動する。原始要素を5つ全部使う、もっとも厚みのある合成機構。`gc reload` 直後の config drift で pool セッションが drain されかかった場合は、割り当てられた仕事を持つセッションを保護して別 tick へ送る（assigned work がある間は drain しない）。pool に同じセッションを別名で拾わせる dual-claim も alias 認識で防がれる。
 - **Health Patrol（= Agent Protocol + Event Bus + Config）** — controller が一定間隔でエージェントの生存と進捗を確認し（Agent Protocol）、`idle_timeout` や `max_restarts` / `restart_window` などの閾値（Config）と比べる。idle 超過ならセッションを kill して即時再起動、短時間に再起動が繰り返されればクラッシュループとみなし5分間 quarantine して wake を抑制する。経緯は Event Bus に流れて外部から観測できる。停滞したワーカ（`assigned` 状態の bead を持ったまま動かないセッション）の検出と、設定が消えた `named-always` セッションの再起動もここに含まれる。主な設定キーは `daemon.patrol_interval`、`idle_timeout`、`max_restarts` / `restart_window`。
 
@@ -214,7 +290,7 @@ graph TB
 
 ---
 
-## 6. 機能の段階的な有効化 — 設定で何が動くかが決まる
+## 7. 機能の段階的な有効化 — 設定で何が動くかが決まる
 
 Gas City はすべての機能を最初から有効にしない。**設定ファイル（`pack.toml` / `city.toml`）に何を書くかに応じて、使える機能が段階的に増えていく**仕組みになっている。
 
@@ -250,11 +326,11 @@ prompt_template = "agents/worker/prompt.template.md"
 
 ---
 
-## 7. bead の分類と pack 流儀
+## 8. bead の分類と pack 流儀
 
 ### 7.1 bead の種類とラベル
 
-§3で見たとおり、Gas City で永続化される作業はすべて bead として表現される。だが、bead は中身によって**種類（type）**で分類されており、ユーザーが日常的に触る代表的な6種類は次のとおり:
+§4 で見たとおり、Gas City で永続化される作業はすべて bead として表現される。だが、bead は中身によって**種類（type）**で分類されており、ユーザーが日常的に触る代表的な6種類は次のとおり:
 
 | 種類 | 表すもの | 主な作成方法 | 親子関係・特徴 |
 |------|---------|-----------|---------------|
