@@ -167,6 +167,9 @@ func configureFSPressureForTests() {
 }
 
 func TestMain(m *testing.M) {
+	if !isTestscriptCommandInvocation(os.Args[0]) {
+		clearProcessLiveEnvForTests()
+	}
 	gcHome, err := os.MkdirTemp("", "gascity-gc-home-*")
 	if err != nil {
 		panic(err)
@@ -1190,6 +1193,28 @@ func TestFindSessionNameByTemplate_SkipsPoolSlotBeads(t *testing.T) {
 	}
 }
 
+func TestLookupSessionNameOrLegacy_CanonicalSingletonPoolManagedBead(t *testing.T) {
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:  "cashmaster/refinery",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:cashmaster/refinery"},
+		Metadata: map[string]string{
+			"template":             "cashmaster/refinery",
+			"agent_name":           "cashmaster/refinery",
+			"session_name":         "s-canonical-refinery",
+			poolManagedMetadataKey: boolMetadata(true),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := lookupSessionNameOrLegacy(store, "city", "cashmaster/refinery", "")
+	if got != "s-canonical-refinery" {
+		t.Fatalf("lookupSessionNameOrLegacy(canonical singleton pool bead) = %q, want s-canonical-refinery", got)
+	}
+}
+
 func TestFindSessionNameByTemplate_SkipsEmptySessionName(t *testing.T) {
 	store := beads.NewMemStore()
 	_, err := store.Create(beads.Bead{
@@ -1529,6 +1554,40 @@ func TestLookupPoolSessionNames_RejectsSharedPrefixSiblingTemplates(t *testing.T
 	}
 	if _, ok := got["frontend/worker-supervisor-1"]; ok {
 		t.Fatalf("lookupPoolSessionNames(frontend/worker) wrongly matched sibling template: %#v", got)
+	}
+}
+
+func TestLookupPoolSessionNames_AcceptsCanonicalSingletonPoolManagedBead(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "refinery", Dir: "cashmaster", MaxActiveSessions: intPtr(1), ScaleCheck: "printf 1"},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	if _, err := store.Create(beads.Bead{
+		Title:  "cashmaster/refinery",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:cashmaster/refinery"},
+		Metadata: map[string]string{
+			"template":             "cashmaster/refinery",
+			"agent_name":           "cashmaster/refinery",
+			"session_name":         "s-canonical-refinery",
+			poolManagedMetadataKey: boolMetadata(true),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if got["cashmaster/refinery"] != "s-canonical-refinery" {
+		t.Fatalf("lookupPoolSessionNames(canonical singleton) = %#v, want canonical session", got)
+	}
+	if _, ok := got["cashmaster/refinery-1"]; ok {
+		t.Fatalf("lookupPoolSessionNames(canonical singleton) registered phantom slot: %#v", got)
 	}
 }
 
@@ -2152,6 +2211,46 @@ func TestSelectRunningPoolSessionRefs_ReturnsAllLiveCandidatesForLogicalInstance
 	}
 }
 
+func TestSelectRunningPoolSessionRefs_CanonicalSingletonIncludesStaleBeadBackedSuffix(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(1)},
+		},
+	}
+	agentCfg := cfg.Agents[0]
+	if _, err := store.Create(beads.Bead{
+		Title:  "stale singleton pool instance",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:frontend/worker-1", "template:frontend/worker"},
+		Metadata: map[string]string{
+			"template":             "frontend/worker",
+			"agent_name":           "frontend/worker-1",
+			"session_name":         "s-stale-worker",
+			"pool_slot":            "1",
+			poolManagedMetadataKey: boolMetadata(true),
+			"state":                "active",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "s-stale-worker", runtime.Config{Command: "echo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	refs, err := selectRunningPoolSessionRefs(store, sp, cfg, resolvePoolSessionRefs(store, cfg, agentCfg.Name, agentCfg.Dir, scaleParamsFor(&agentCfg), &agentCfg, "test-city", "", sp, io.Discard))
+	if err != nil {
+		t.Fatalf("selectRunningPoolSessionRefs: %v", err)
+	}
+	for _, ref := range refs {
+		if ref.qualifiedInstance == "frontend/worker-1" && ref.sessionName == "s-stale-worker" {
+			return
+		}
+	}
+	t.Fatalf("selectRunningPoolSessionRefs() = %#v, want stale bead-backed singleton suffix ref", refs)
+}
+
 func TestSelectRunningPoolSessionRefs_ReportsConcreteSessionOnProbeFailure(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{
@@ -2485,10 +2584,14 @@ func TestDoInitSuccess(t *testing.T) {
 	if !strings.Contains(packToml, "schema = 2") {
 		t.Errorf("pack.toml missing schema 2:\n%s", packToml)
 	}
+	if strings.Contains(packToml, "[[agent]]") {
+		t.Errorf("fresh init should not emit inline [[agent]] entries into pack.toml:\n%s", packToml)
+	}
 
 	// Verify the composed config loads correctly from pack.toml + city.toml.
-	// agents + named_session live in pack.toml (pack-first); workspace name
-	// lives in .gc/site.toml as the machine-local binding.
+	// The mayor comes from the scaffolded agents/<name>/ tree, while the
+	// named session still lives in pack.toml. workspace name lives in
+	// .gc/site.toml as the machine-local binding.
 	cfg, err := loadCityConfigFS(f, filepath.Join("/bright-lights", "city.toml"))
 	if err != nil {
 		t.Fatalf("loading written config: %v", err)
@@ -2529,16 +2632,12 @@ func TestDoInitWritesExpectedTOML(t *testing.T) {
 		t.Errorf("city.toml content:\ngot:\n%s\nwant:\n%s", got, want)
 	}
 
-	// pack.toml owns the portable definition: [pack] + [[agent]] mayor +
-	// [[named_session]] mayor (pack-first scaffold from tutorial 01).
+	// pack.toml keeps the portable pack metadata and named session; the
+	// fresh mayor scaffold now comes from agents/<name>/ discovery.
 	packGot := string(f.Files[filepath.Join("/bright-lights", "pack.toml")])
 	packWant := `[pack]
 name = "bright-lights"
 schema = 2
-
-[[agent]]
-name = "mayor"
-prompt_template = "agents/mayor/prompt.template.md"
 
 [[named_session]]
 template = "mayor"
@@ -2987,8 +3086,8 @@ func TestRunWizardTutorialAliasMapsToMinimal(t *testing.T) {
 }
 
 func TestRunWizardSelectCursorByNumber(t *testing.T) {
-	// Cursor is #5 in the order.
-	stdin := strings.NewReader("\n5\n")
+	// Cursor is #6 in the order.
+	stdin := strings.NewReader("\n6\n")
 	var stdout bytes.Buffer
 	wiz := runWizard(stdin, &stdout)
 
@@ -3070,8 +3169,8 @@ func TestDoInitWithWizardConfig(t *testing.T) {
 	}
 
 	// Verify written raw city.toml keeps the provider (runtime-local) and
-	// the composed config (city.toml + pack.toml) surfaces the mayor agent
-	// from the pack-first scaffold.
+	// the composed config (city.toml + pack.toml) still surfaces the mayor
+	// agent from the scaffolded agents/<name>/ tree.
 	data := f.Files[filepath.Join("/bright-lights", "city.toml")]
 	raw, err := config.Parse(data)
 	if err != nil {
@@ -3115,7 +3214,8 @@ func TestDoInitWithCustomCommand(t *testing.T) {
 	}
 
 	// Verify raw city.toml carries start_command and no provider; the
-	// composed config then surfaces the mayor agent from pack.toml.
+	// composed config then surfaces the mayor agent from convention
+	// discovery.
 	data := f.Files[filepath.Join("/bright-lights", "city.toml")]
 	raw, err := config.Parse(data)
 	if err != nil {
@@ -3165,11 +3265,11 @@ func TestDoInitWithGastownTemplate(t *testing.T) {
 	if cfg.Workspace.Provider != "claude" {
 		t.Errorf("Workspace.Provider = %q, want %q", cfg.Workspace.Provider, "claude")
 	}
-	if len(cfg.Workspace.Includes) != 0 {
-		t.Errorf("Workspace.Includes = %v, want empty", cfg.Workspace.Includes)
+	if len(cfg.Workspace.LegacyIncludes()) != 0 {
+		t.Errorf("Workspace.Includes = %v, want empty", cfg.Workspace.LegacyIncludes())
 	}
-	if len(cfg.Workspace.DefaultRigIncludes) != 0 {
-		t.Errorf("Workspace.DefaultRigIncludes = %v, want empty", cfg.Workspace.DefaultRigIncludes)
+	if len(cfg.Workspace.LegacyDefaultRigIncludes()) != 0 {
+		t.Errorf("Workspace.DefaultRigIncludes = %v, want empty", cfg.Workspace.LegacyDefaultRigIncludes())
 	}
 	// No inline agents.
 	if len(cfg.Agents) != 0 {
@@ -3199,7 +3299,8 @@ func TestDoInitWithCustomTemplate(t *testing.T) {
 	}
 
 	// Custom template → DefaultCity (one mayor, no provider). The mayor
-	// agent lives in pack.toml after the pack-first scaffold split.
+	// now comes from the scaffolded agents/<name>/ tree rather than an
+	// inline pack.toml [[agent]].
 	data := f.Files[filepath.Join("/my-city", "city.toml")]
 	raw, err := config.Parse(data)
 	if err != nil {
