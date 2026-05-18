@@ -7,6 +7,7 @@
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--city` | string |  | path to the city directory (default: walk up from cwd) |
+| `--json-schema` | string |  | emit JSON Schema for this command; optional value: result or failure |
 | `--rig` | string |  | rig name or path (default: discover from cwd) |
 
 ## gc
@@ -556,12 +557,14 @@ gc config show [flags]
 gc config show
   gc config show --validate
   gc config show --provenance
+  gc config show --json
   gc config show -f overlay.toml
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-f`, `--file` | stringArray |  | additional config files to layer (can be repeated) |
+| `--json` | bool |  | emit JSON |
 | `--provenance` | bool |  | show where each config element originated |
 | `--validate` | bool |  | validate config and exit (0 = valid, 1 = errors) |
 
@@ -960,11 +963,13 @@ gc doctor [flags]
 gc doctor
   gc doctor --fix
   gc doctor --verbose
+  gc doctor --json
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--fix` | bool |  | attempt automatic repairs and safe mechanical migrations |
+| `--json` | bool |  | emit structured JSON instead of human-readable output |
 | `-v`, `--verbose` | bool |  | show extra diagnostic details |
 
 ## gc dolt-cleanup
@@ -1087,6 +1092,33 @@ gc events
 | `--timeout` | string | `30s` | Max wait duration for --watch (e.g. 30s, 5m) |
 | `--type` | string |  | Filter by event type (e.g. bead.created) |
 | `--watch` | bool |  | Block until matching events arrive (exits after first match or buffered replay) |
+
+| Subcommand | Description |
+|------------|-------------|
+| [gc events rotate](#gc-events-rotate) | Force rotate the city event log |
+
+## gc events rotate
+
+Force rotate the city event log through the running supervisor.
+
+Output is one JSON line. Empty active logs are successful no-ops.
+
+```
+gc events rotate [flags]
+```
+
+**Example:**
+
+```
+gc events rotate
+  gc events rotate --wait
+  gc --city /path/to/city events rotate --api http://127.0.0.1:8080
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--api` | string |  | GC API server URL override (auto-discovered by default) |
+| `--wait` | bool |  | Wait for archive compression to complete before returning |
 
 ## gc formula
 
@@ -2744,6 +2776,7 @@ gc sling [target] <bead-or-formula-or-text> [flags]
 | `-n`, `--dry-run` | bool |  | show what would be done without executing |
 | `--force` | bool |  | suppress warnings, allow cross-rig routing, allow graph workflow replacement, and for direct bead routes dispatch even if the bead does not resolve in the local store |
 | `-f`, `--formula` | bool |  | treat argument as formula name |
+| `--json` | bool |  | Output dispatch result in JSON format |
 | `--merge` | string |  | merge strategy: direct, mr, or local |
 | `--no-convoy` | bool |  | skip auto-convoy creation |
 | `--no-formula` | bool |  | suppress default formula (route raw bead) |
@@ -2782,6 +2815,7 @@ gc start
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-n`, `--dry-run` | bool |  | preview what agents would start without starting them |
+| `--no-auto-restart` | bool |  | detect supervisor binary drift but do not auto-restart; exits non-zero on drift |
 
 ## gc status
 
@@ -2905,8 +2939,12 @@ gc supervisor start
 Check if the supervisor is running
 
 ```
-gc supervisor status
+gc supervisor status [flags]
 ```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | emit JSON |
 
 ## gc supervisor stop
 
@@ -3120,8 +3158,12 @@ gc wait cancel <wait-id>
 Show details for a wait
 
 ```
-gc wait inspect <wait-id>
+gc wait inspect <wait-id> [flags]
 ```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | emit JSON |
 
 ## gc wait list
 
@@ -3133,6 +3175,7 @@ gc wait list [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--json` | bool |  | emit JSON |
 | `--session` | string |  | filter by session ID |
 | `--state` | string |  | filter by wait state |
 

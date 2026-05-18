@@ -641,6 +641,76 @@ func TestProcessScopeCheckReturnsMalformedWhenScopeBodyMissing(t *testing.T) {
 	}
 }
 
+func TestProcessScopeCheckRetriesTransientMissingScopeBody(t *testing.T) {
+	t.Parallel()
+
+	mem := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, mem, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	body := mustCreateWorkflowBead(t, mem, beads.Bead{
+		Title: "body",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.scope_role":   "body",
+			"gc.root_bead_id": workflow.ID,
+			"gc.step_ref":     "demo.body",
+		},
+	})
+	step := mustCreateWorkflowBead(t, mem, beads.Bead{
+		Title:  "preflight",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "member",
+			"gc.outcome":      "pass",
+		},
+	})
+	control := mustCreateWorkflowBead(t, mem, beads.Bead{
+		Title: "Finalize scope for preflight",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope-check",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "body",
+			"gc.scope_role":   "control",
+		},
+	})
+	mustDepAdd(t, mem, control.ID, step.ID, "blocks")
+
+	store := &transientMissingScopeBodyStore{
+		MemStore:  mem,
+		bodyID:    body.ID,
+		rootID:    workflow.ID,
+		hideReads: 3,
+	}
+	result, err := ProcessControl(store, control, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl: %v", err)
+	}
+	if result.Action != "scope-pass" {
+		t.Fatalf("action = %q, want scope-pass", result.Action)
+	}
+	if store.hiddenReads != 3 {
+		t.Fatalf("hiddenReads = %d, want 3", store.hiddenReads)
+	}
+	bodyAfter := mustGetBead(t, mem, body.ID)
+	if bodyAfter.Status != "closed" {
+		t.Fatalf("body status = %q, want closed", bodyAfter.Status)
+	}
+	if got := bodyAfter.Metadata["gc.outcome"]; got != "pass" {
+		t.Fatalf("body outcome = %q, want pass", got)
+	}
+}
+
 func TestProcessFanoutReturnsMalformedWhenScopeBodyMissing(t *testing.T) {
 	t.Parallel()
 
@@ -939,6 +1009,14 @@ type scopeBodyVanishAfterFirstResolveStore struct {
 	resolved bool
 }
 
+type transientMissingScopeBodyStore struct {
+	*beads.MemStore
+	bodyID      string
+	rootID      string
+	hideReads   int
+	hiddenReads int
+}
+
 type workflowFinalizeCloseFailStore struct {
 	beads.Store
 	finalizerID string
@@ -971,8 +1049,24 @@ func (s *scopeBodyVanishAfterFirstResolveStore) List(query beads.ListQuery) ([]b
 	return filterBeadID(result, s.bodyID), nil
 }
 
+func (s *transientMissingScopeBodyStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	result, err := s.MemStore.List(query)
+	if err != nil {
+		return nil, err
+	}
+	if !canResolveScopeBodyQuery(query, s.rootID) || !containsBeadID(result, s.bodyID) || s.hiddenReads >= s.hideReads {
+		return result, nil
+	}
+	s.hiddenReads++
+	return filterBeadID(result, s.bodyID), nil
+}
+
 func (s *scopeBodyVanishAfterFirstResolveStore) canResolveScopeBody(query beads.ListQuery) bool {
-	if query.Metadata["gc.root_bead_id"] != s.rootID {
+	return canResolveScopeBodyQuery(query, s.rootID)
+}
+
+func canResolveScopeBodyQuery(query beads.ListQuery, rootID string) bool {
+	if query.Metadata["gc.root_bead_id"] != rootID {
 		return false
 	}
 	if query.Metadata["gc.kind"] == "scope" && query.Metadata["gc.scope_role"] == "body" {
@@ -3345,6 +3439,148 @@ func TestProcessRalphCheckRetriesNestedAttemptScope(t *testing.T) {
 	}
 	if !foundMemberReady {
 		t.Fatalf("expected cloned nested member %s to be ready; ready=%+v", clonedMember.ID, ready)
+	}
+}
+
+func TestAppendRalphRetryClonesIterationFanoutControls(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	logical := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "review loop",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "ralph",
+			"gc.step_id":      "review-loop",
+			"gc.step_ref":     "mol-review.review-loop",
+			"gc.max_attempts": "2",
+			"gc.root_bead_id": workflow.ID,
+		},
+	})
+	run1 := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "review loop iteration 1",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":            "scope",
+			"gc.scope_role":      "body",
+			"gc.scope_name":      "review-loop",
+			"gc.step_ref":        "mol-review.review-loop.iteration.1",
+			"gc.step_id":         "review-loop",
+			"gc.ralph_step_id":   "review-loop",
+			"gc.attempt":         "1",
+			"gc.root_bead_id":    workflow.ID,
+			"gc.logical_bead_id": logical.ID,
+		},
+	})
+	source := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "List design council members",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.scope_ref":            "mol-review.review-loop.iteration.1",
+			"gc.scope_role":           "member",
+			"gc.step_ref":             "mol-review.review-loop.iteration.1.dc-members",
+			"gc.step_id":              "dc-members",
+			"gc.ralph_step_id":        "review-loop",
+			"gc.attempt":              "1",
+			"gc.root_bead_id":         workflow.ID,
+			"gc.output_json_required": "true",
+		},
+	})
+	fanout := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Expand fanout for List design council members",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":          "fanout",
+			"gc.scope_ref":     "mol-review.review-loop.iteration.1",
+			"gc.scope_role":    "member",
+			"gc.step_ref":      "mol-review.review-loop.iteration.1.dc-members-fanout",
+			"gc.control_for":   "mol-review.review-loop.iteration.1.dc-members",
+			"gc.for_each":      "output.members",
+			"gc.bond":          "review-member",
+			"gc.fanout_mode":   "parallel",
+			"gc.step_id":       "dc-members",
+			"gc.ralph_step_id": "review-loop",
+			"gc.attempt":       "1",
+			"gc.root_bead_id":  workflow.ID,
+		},
+	})
+	check1 := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "check review loop",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":            "check",
+			"gc.step_id":         "review-loop",
+			"gc.ralph_step_id":   "review-loop",
+			"gc.attempt":         "1",
+			"gc.step_ref":        "mol-review.review-loop.check.1",
+			"gc.check_mode":      "exec",
+			"gc.check_path":      ".gc/scripts/check.sh",
+			"gc.check_timeout":   "30s",
+			"gc.max_attempts":    "2",
+			"gc.root_bead_id":    workflow.ID,
+			"gc.logical_bead_id": logical.ID,
+		},
+	})
+
+	mustDepAdd(t, store, fanout.ID, source.ID, "blocks")
+	mustDepAdd(t, store, run1.ID, fanout.ID, "blocks")
+	mustDepAdd(t, store, check1.ID, run1.ID, "blocks")
+	mustDepAdd(t, store, logical.ID, check1.ID, "blocks")
+
+	mapping, err := appendRalphRetry(store, logical.ID, run1, check1, 2, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("appendRalphRetry: %v", err)
+	}
+	run2 := mustGetBead(t, store, mapping[run1.ID])
+	source2 := mustGetBead(t, store, mapping[source.ID])
+	fanout2 := mustGetBead(t, store, mapping[fanout.ID])
+
+	if got := run2.Metadata["gc.step_ref"]; got != "mol-review.review-loop.iteration.2" {
+		t.Fatalf("run2 gc.step_ref = %q, want mol-review.review-loop.iteration.2", got)
+	}
+	if got := source2.Metadata["gc.scope_ref"]; got != run2.Metadata["gc.step_ref"] {
+		t.Fatalf("source2 gc.scope_ref = %q, want %q", got, run2.Metadata["gc.step_ref"])
+	}
+	if got := source2.Metadata["gc.step_ref"]; got != "mol-review.review-loop.iteration.2.dc-members" {
+		t.Fatalf("source2 gc.step_ref = %q, want mol-review.review-loop.iteration.2.dc-members", got)
+	}
+	if got := source2.Metadata["gc.output_json_required"]; got != "true" {
+		t.Fatalf("source2 gc.output_json_required = %q, want true", got)
+	}
+	if got := fanout2.Metadata["gc.scope_ref"]; got != run2.Metadata["gc.step_ref"] {
+		t.Fatalf("fanout2 gc.scope_ref = %q, want %q", got, run2.Metadata["gc.step_ref"])
+	}
+	if got := fanout2.Metadata["gc.control_for"]; got != source2.Metadata["gc.step_ref"] {
+		t.Fatalf("fanout2 gc.control_for = %q, want %q", got, source2.Metadata["gc.step_ref"])
+	}
+	if got := fanout2.Metadata["gc.step_ref"]; got != "mol-review.review-loop.iteration.2.dc-members-fanout" {
+		t.Fatalf("fanout2 gc.step_ref = %q, want mol-review.review-loop.iteration.2.dc-members-fanout", got)
+	}
+	if got := fanout2.Metadata["gc.attempt"]; got != "2" {
+		t.Fatalf("fanout2 gc.attempt = %q, want 2", got)
+	}
+
+	deps, err := store.DepList(fanout2.ID, "down")
+	if err != nil {
+		t.Fatalf("fanout2 deps: %v", err)
+	}
+	foundSourceDep := false
+	for _, dep := range deps {
+		if dep.Type == "blocks" && dep.DependsOnID == source2.ID {
+			foundSourceDep = true
+			break
+		}
+	}
+	if !foundSourceDep {
+		t.Fatalf("fanout2 missing blocks dependency on source2; deps = %+v", deps)
 	}
 }
 
@@ -6212,6 +6448,15 @@ func TestRewriteRalphAttemptRefRewritesInnermostMatchingAttempt(t *testing.T) {
 	got := rewriteRalphAttemptRef("outer.run.1.inner.run.1", 1, 2)
 	if got != "outer.run.1.inner.run.2" {
 		t.Fatalf("rewriteRalphAttemptRef() = %q, want innermost attempt rewritten", got)
+	}
+}
+
+func TestRewriteRalphAttemptRefRewritesIterationAttempt(t *testing.T) {
+	t.Parallel()
+
+	got := rewriteRalphAttemptRef("mol-review.review-loop.iteration.1", 1, 2)
+	if got != "mol-review.review-loop.iteration.2" {
+		t.Fatalf("rewriteRalphAttemptRef() = %q, want iteration attempt rewritten", got)
 	}
 }
 
