@@ -692,15 +692,26 @@ func TestProcessScopeCheckRetriesTransientMissingScopeBody(t *testing.T) {
 		rootID:    workflow.ID,
 		hideReads: 3,
 	}
-	result, err := ProcessControl(store, control, ProcessOptions{})
+	var trace bytes.Buffer
+	result, err := ProcessControl(store, control, ProcessOptions{
+		Tracef: func(format string, args ...any) {
+			fmt.Fprintf(&trace, format+"\n", args...) //nolint:errcheck // test buffer
+		},
+	})
 	if err != nil {
 		t.Fatalf("ProcessControl: %v", err)
 	}
 	if result.Action != "scope-pass" {
 		t.Fatalf("action = %q, want scope-pass", result.Action)
 	}
-	if store.hiddenReads != 3 {
-		t.Fatalf("hiddenReads = %d, want 3", store.hiddenReads)
+	if store.hiddenReads == 0 {
+		t.Fatal("hiddenReads = 0, want transient missing-body path exercised")
+	}
+	traceText := trace.String()
+	if !strings.Contains(traceText, "resolve-body attempt=") ||
+		!strings.Contains(traceText, "reason=missing_body") ||
+		!strings.Contains(traceText, "result=ok") {
+		t.Fatalf("trace = %q, want per-attempt missing-body retry and success", traceText)
 	}
 	bodyAfter := mustGetBead(t, mem, body.ID)
 	if bodyAfter.Status != "closed" {
@@ -708,6 +719,46 @@ func TestProcessScopeCheckRetriesTransientMissingScopeBody(t *testing.T) {
 	}
 	if got := bodyAfter.Metadata["gc.outcome"]; got != "pass" {
 		t.Fatalf("body outcome = %q, want pass", got)
+	}
+}
+
+func TestResolveScopeBodyStopsRetryWhenContextCanceled(t *testing.T) {
+	t.Parallel()
+
+	mem := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, mem, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	body := mustCreateWorkflowBead(t, mem, beads.Bead{
+		Title: "body",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.scope_role":   "body",
+			"gc.root_bead_id": workflow.ID,
+			"gc.step_ref":     "demo.body",
+		},
+	})
+	store := &transientMissingScopeBodyStore{
+		MemStore:  mem,
+		bodyID:    body.ID,
+		rootID:    workflow.ID,
+		hideReads: scopeBodyResolveAttempts,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := resolveScopeBody(store, workflow.ID, "body", "control", ProcessOptions{Context: ctx})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("resolveScopeBody error = %v, want context.Canceled", err)
+	}
+	if store.hiddenReads == 0 || store.hiddenReads >= store.hideReads {
+		t.Fatalf("hiddenReads = %d, want cancellation before exhausting %d hidden reads", store.hiddenReads, store.hideReads)
 	}
 }
 
@@ -3824,13 +3875,16 @@ needs = ["{target}.review"]
 		Title: "Expand fanout for survey",
 		Type:  "task",
 		Metadata: map[string]string{
-			"gc.kind":         "fanout",
-			"gc.root_bead_id": workflow.ID,
-			"gc.control_for":  "demo.survey",
-			"gc.for_each":     "output.items",
-			"gc.bond":         "expansion-review",
-			"gc.bond_vars":    `{"reviewer":"{item.name}"}`,
-			"gc.fanout_mode":  "parallel",
+			"gc.kind":                   "fanout",
+			"gc.root_bead_id":           workflow.ID,
+			"gc.control_for":            "demo.survey",
+			"gc.for_each":               "output.items",
+			"gc.bond":                   "expansion-review",
+			"gc.bond_vars":              `{"reviewer":"{item.name}"}`,
+			"gc.fanout_mode":            "parallel",
+			"gc.controller_error":       "previous invalid connection",
+			"gc.controller_error_class": "transient",
+			"gc.controller_retryable":   "true",
 		},
 	})
 	mustDepAdd(t, store, fanout.ID, source.ID, "blocks")
@@ -3903,6 +3957,11 @@ needs = ["{target}.review"]
 	fanoutClosed := mustGetBead(t, store, fanout.ID)
 	if fanoutClosed.Status != "closed" || fanoutClosed.Metadata["gc.outcome"] != "pass" {
 		t.Fatalf("fanout = status %q outcome %q, want closed/pass", fanoutClosed.Status, fanoutClosed.Metadata["gc.outcome"])
+	}
+	if fanoutClosed.Metadata["gc.controller_error"] != "" ||
+		fanoutClosed.Metadata["gc.controller_error_class"] != "" ||
+		fanoutClosed.Metadata["gc.controller_retryable"] != "" {
+		t.Fatalf("controller error metadata = %#v, want cleared", fanoutClosed.Metadata)
 	}
 }
 
@@ -6618,7 +6677,16 @@ func TestRunRalphCheckTimeoutMetadataPrecedence(t *testing.T) {
 
 func TestRunRalphCheckUsesStorePathForRelativeCheckAndSubjectEnv(t *testing.T) {
 	cityPath := t.TempDir()
-	storePath := t.TempDir()
+	// storePath models a rig store living as a subtree of the city, matching
+	// the production rig layout. The disjoint-tempdir construction this test
+	// previously used was unrealistic and obscured the gastownhall/gascity#2320
+	// envelope/base distinction: relative gc.check_path now resolves under
+	// storePath (the join base) but containment is validated against cityPath
+	// (the security envelope).
+	storePath := filepath.Join(cityPath, "rig-store")
+	if err := os.MkdirAll(storePath, 0o755); err != nil {
+		t.Fatalf("mkdir rig-store: %v", err)
+	}
 	workDir := filepath.Join(storePath, "frontend")
 	checkDir := filepath.Join(workDir, "checks")
 	if err := os.MkdirAll(checkDir, 0o755); err != nil {
@@ -6668,6 +6736,99 @@ func TestRunRalphCheckUsesStorePathForRelativeCheckAndSubjectEnv(t *testing.T) {
 		if !strings.Contains(result.Stdout, want) {
 			t.Fatalf("stdout = %q, want to contain %q", result.Stdout, want)
 		}
+	}
+}
+
+// TestRunRalphCheckRigScopedRelativeCheckPathResolvesAgainstStore pins the
+// gastownhall/gascity#2320 fix: a ralph check bead with a relative
+// gc.check_path and a storePath that is a SUBTREE of cityPath. The
+// gc.check_path here (`../scripts/check.sh`) deliberately escapes the store
+// (the join base) upward into the city tree (the security envelope) — the
+// exact shape that fails pre-fix. Before the envelope/base split,
+// ResolveConditionPath conflated the two roles, so this relative path was
+// validated against storePath and the traversal check rejected it even
+// though the script is comfortably inside the city envelope.
+func TestRunRalphCheckRigScopedRelativeCheckPathResolvesAgainstStore(t *testing.T) {
+	cityPath := t.TempDir()
+	storePath := filepath.Join(cityPath, "rig-frontend")
+	if err := os.MkdirAll(storePath, 0o755); err != nil {
+		t.Fatalf("mkdir store: %v", err)
+	}
+	// Script lives under the city tree, NOT under the store. A relative
+	// gc.check_path must climb out of the store to reach it.
+	scriptDir := filepath.Join(cityPath, "scripts")
+	if err := os.MkdirAll(scriptDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	scriptPath := filepath.Join(scriptDir, "check.sh")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	store := beads.NewMemStore()
+	check := beads.Bead{
+		ID:   "check-rig",
+		Type: "task",
+		Metadata: map[string]string{
+			"gc.check_path":    "../scripts/check.sh",
+			"gc.check_timeout": "30s",
+		},
+	}
+	subject := beads.Bead{ID: "run-rig", Type: "task"}
+
+	result, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+		CityPath:  cityPath,
+		StorePath: storePath,
+	})
+	if err != nil {
+		t.Fatalf("runRalphCheck: %v", err)
+	}
+	if result.Outcome != "pass" {
+		t.Fatalf("Outcome = %q, want pass (stderr=%q)", result.Outcome, result.Stderr)
+	}
+}
+
+// TestRunRalphCheckRejectsPathTraversalAboveCityPath pins the security
+// contract: when envelope (cityPath) and base (scriptBase) diverge, a
+// relative gc.check_path that traverses above the city must still be
+// rejected even though it might otherwise resolve via the join base.
+func TestRunRalphCheckRejectsPathTraversalAboveCityPath(t *testing.T) {
+	parent := t.TempDir()
+	cityPath := filepath.Join(parent, "city")
+	storePath := filepath.Join(cityPath, "rig-frontend")
+	if err := os.MkdirAll(storePath, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Outside script lives above cityPath — must be rejected by the envelope.
+	outsideDir := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	outsideScript := filepath.Join(outsideDir, "check.sh")
+	if err := os.WriteFile(outsideScript, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	store := beads.NewMemStore()
+	check := beads.Bead{
+		ID:   "check-evil",
+		Type: "task",
+		Metadata: map[string]string{
+			"gc.check_path":    "../../outside/check.sh",
+			"gc.check_timeout": "30s",
+		},
+	}
+	subject := beads.Bead{ID: "run-evil", Type: "task"}
+
+	result, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+		CityPath:  cityPath,
+		StorePath: storePath,
+	})
+	if err == nil {
+		t.Fatalf("expected traversal rejection, got outcome=%q stdout=%q", result.Outcome, result.Stdout)
+	}
+	if !strings.Contains(err.Error(), "traversal") {
+		t.Errorf("expected traversal error, got: %v", err)
 	}
 }
 
