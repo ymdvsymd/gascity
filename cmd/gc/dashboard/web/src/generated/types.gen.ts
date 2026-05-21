@@ -74,6 +74,7 @@ export type AgentPatch = {
     InjectFragmentsAppend: Array<string> | null;
     InstallAgentHooks: Array<string> | null;
     InstallAgentHooksAppend: Array<string> | null;
+    Lifecycle: string | null;
     MCP: Array<string> | null;
     MCPAppend: Array<string> | null;
     MaxActiveSessions: number | null;
@@ -748,7 +749,7 @@ export type EventEmitRequest = {
     type: string;
 };
 
-export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | SupervisorFsPressureSkippedTickPayload | UnboundEventPayload | WorkerOperationEventPayload;
+export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | SupervisorFsPressureSkippedTickPayload | SupervisorShutdownPayload | UnboundEventPayload | WorkerOperationEventPayload;
 
 export type EventRotateAnchor = {
     /**
@@ -2493,6 +2494,13 @@ export type SessionPendingResponse = {
     supported: boolean;
 };
 
+export type SessionPermissionModeBody = {
+    /**
+     * Provider schema value for the permission_mode option.
+     */
+    permission_mode: string;
+};
+
 /**
  * Session raw transcript frame
  *
@@ -2938,6 +2946,25 @@ export type SupervisorHealthOutputBody = {
     version: string;
 };
 
+export type SupervisorShutdownPayload = {
+    /**
+     * For source=socket_stop, the address reported by the connecting client. Typically empty for unix-socket peers.
+     */
+    client_addr?: string;
+    /**
+     * Resulting shutdown mode.
+     */
+    mode: 'destructive' | 'preserve_sessions' | 'unknown';
+    /**
+     * For source=signal, the human-readable signal name (e.g. "terminated", "interrupt"). Empty for socket_stop.
+     */
+    signal?: string;
+    /**
+     * Which path triggered the shutdown.
+     */
+    source: 'signal' | 'socket_stop';
+};
+
 export type SupervisorStartup = {
     /**
      * Current phase (when not ready).
@@ -3077,8 +3104,12 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeSessionUpdated) | ({
     type: 'session.woke';
 } & TypedEventStreamEnvelopeSessionWoke) | ({
+    type: 'session.work_query_failed';
+} & TypedEventStreamEnvelopeSessionWorkQueryFailed) | ({
     type: 'supervisor.fs_pressure.skipped_tick';
 } & TypedEventStreamEnvelopeSupervisorFsPressureSkippedTick) | ({
+    type: 'supervisor.shutdown_requested';
+} & TypedEventStreamEnvelopeSupervisorShutdownRequested) | ({
     type: 'worker.operation';
 } & TypedEventStreamEnvelopeWorkerOperation) | ({
     type: 'TypedEventStreamEnvelopeCustom';
@@ -3771,6 +3802,20 @@ export type TypedEventStreamEnvelopeSessionWoke = {
 };
 
 /**
+ * TypedEventStreamEnvelope session.work_query_failed
+ */
+export type TypedEventStreamEnvelopeSessionWorkQueryFailed = {
+    actor: string;
+    message?: string;
+    payload: SessionLifecyclePayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'session.work_query_failed';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope supervisor.fs_pressure.skipped_tick
  */
 export type TypedEventStreamEnvelopeSupervisorFsPressureSkippedTick = {
@@ -3781,6 +3826,20 @@ export type TypedEventStreamEnvelopeSupervisorFsPressureSkippedTick = {
     subject?: string;
     ts: string;
     type: 'supervisor.fs_pressure.skipped_tick';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope supervisor.shutdown_requested
+ */
+export type TypedEventStreamEnvelopeSupervisorShutdownRequested = {
+    actor: string;
+    message?: string;
+    payload: SupervisorShutdownPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'supervisor.shutdown_requested';
     workflow?: WorkflowEventProjection;
 };
 
@@ -3900,8 +3959,12 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeSessionUpdated) | ({
     type: 'session.woke';
 } & TypedTaggedEventStreamEnvelopeSessionWoke) | ({
+    type: 'session.work_query_failed';
+} & TypedTaggedEventStreamEnvelopeSessionWorkQueryFailed) | ({
     type: 'supervisor.fs_pressure.skipped_tick';
 } & TypedTaggedEventStreamEnvelopeSupervisorFsPressureSkippedTick) | ({
+    type: 'supervisor.shutdown_requested';
+} & TypedTaggedEventStreamEnvelopeSupervisorShutdownRequested) | ({
     type: 'worker.operation';
 } & TypedTaggedEventStreamEnvelopeWorkerOperation) | ({
     type: 'TypedTaggedEventStreamEnvelopeCustom';
@@ -4643,6 +4706,21 @@ export type TypedTaggedEventStreamEnvelopeSessionWoke = {
 };
 
 /**
+ * TypedTaggedEventStreamEnvelope session.work_query_failed
+ */
+export type TypedTaggedEventStreamEnvelopeSessionWorkQueryFailed = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: SessionLifecyclePayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'session.work_query_failed';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedTaggedEventStreamEnvelope supervisor.fs_pressure.skipped_tick
  */
 export type TypedTaggedEventStreamEnvelopeSupervisorFsPressureSkippedTick = {
@@ -4654,6 +4732,21 @@ export type TypedTaggedEventStreamEnvelopeSupervisorFsPressureSkippedTick = {
     subject?: string;
     ts: string;
     type: 'supervisor.fs_pressure.skipped_tick';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope supervisor.shutdown_requested
+ */
+export type TypedTaggedEventStreamEnvelopeSupervisorShutdownRequested = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: SupervisorShutdownPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'supervisor.shutdown_requested';
     workflow?: WorkflowEventProjection;
 };
 
@@ -9769,6 +9862,46 @@ export type GetV0CityByCityNameSessionByIdPendingResponses = {
 };
 
 export type GetV0CityByCityNameSessionByIdPendingResponse = GetV0CityByCityNameSessionByIdPendingResponses[keyof GetV0CityByCityNameSessionByIdPendingResponses];
+
+export type PostV0CityByCityNameSessionByIdPermissionModeData = {
+    body: SessionPermissionModeBody;
+    headers: {
+        /**
+         * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
+         */
+        'X-GC-Request': string;
+    };
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * Session ID, alias, or runtime session_name.
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/session/{id}/permission-mode';
+};
+
+export type PostV0CityByCityNameSessionByIdPermissionModeErrors = {
+    /**
+     * Error
+     */
+    default: ErrorModel;
+};
+
+export type PostV0CityByCityNameSessionByIdPermissionModeError = PostV0CityByCityNameSessionByIdPermissionModeErrors[keyof PostV0CityByCityNameSessionByIdPermissionModeErrors];
+
+export type PostV0CityByCityNameSessionByIdPermissionModeResponses = {
+    /**
+     * OK
+     */
+    200: SessionResponse;
+};
+
+export type PostV0CityByCityNameSessionByIdPermissionModeResponse = PostV0CityByCityNameSessionByIdPermissionModeResponses[keyof PostV0CityByCityNameSessionByIdPermissionModeResponses];
 
 export type PostV0CityByCityNameSessionByIdRenameData = {
     body: SessionRenameInputBody;

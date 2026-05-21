@@ -645,7 +645,19 @@ func prepareStartCandidateForCity(
 	stderr io.Writer,
 ) (*preparedStart, error) {
 	session := candidate.session
-	if _, _, err := preWakeCommit(session, store, clk); err != nil {
+	if session != nil && strings.TrimSpace(session.ID) != "" && store != nil {
+		if err := sessionpkg.WithSessionMutationLock(session.ID, func() error {
+			current, err := store.Get(session.ID)
+			if err != nil {
+				return err
+			}
+			candidate.session = &current
+			_, _, err = preWakeCommit(candidate.session, store, clk)
+			return err
+		}); err != nil {
+			return nil, err
+		}
+	} else if _, _, err := preWakeCommit(session, store, clk); err != nil {
 		return nil, err
 	}
 	candidate = refreshConfiguredNamedStartCandidate(candidate, cityPath, cityName, cfg, sp, store, clk, stderr)
@@ -708,6 +720,7 @@ func buildPreparedStart(
 				log.Printf("session %s: invalid template_overrides JSON: %v", session.ID, err)
 			} else if len(overrides) > 0 {
 				fullOptions := make(map[string]string)
+				hasSchemaOverride := false
 				for k, v := range tp.ResolvedProvider.EffectiveDefaults {
 					fullOptions[k] = v
 				}
@@ -716,12 +729,20 @@ func buildPreparedStart(
 						continue // handled separately below, not a schema option
 					}
 					fullOptions[k] = v
+					hasSchemaOverride = true
 				}
 				args, resolveErr := config.ResolveExplicitOptions(tp.ResolvedProvider.OptionsSchema, fullOptions)
 				if resolveErr != nil {
 					log.Printf("session %s: template_overrides resolution error: %v", session.ID, resolveErr)
 				} else if len(args) > 0 {
 					agentCfg.Command = replaceSchemaFlags(agentCfg.Command, tp.ResolvedProvider.OptionsSchema, args)
+				}
+				if hasSchemaOverride {
+					if command, err := config.BuildProviderResumeCommand(tp.ResolvedProvider, overrides); err == nil && strings.TrimSpace(command) != "" {
+						resolved := *tp.ResolvedProvider
+						resolved.ResumeCommand = command
+						tp.ResolvedProvider = &resolved
+					}
 				}
 			}
 		}
@@ -1385,18 +1406,8 @@ func observeRuntimeProviderLiveness(sp runtime.Provider, name string, processNam
 	if sp == nil || strings.TrimSpace(name) == "" {
 		return false, false
 	}
-	return runtimeProviderLivenessFromRunning(sp, name, processNames, sp.IsRunning(name))
-}
-
-func runtimeProviderLivenessFromRunning(sp runtime.Provider, name string, processNames []string, running bool) (bool, bool) {
-	if len(processNames) == 0 {
-		return running, running
-	}
-	alive := sp.ProcessAlive(name, processNames)
-	if alive && !running {
-		running = true
-	}
-	return running, alive
+	obs := runtime.ObserveLiveness(sp, name, processNames)
+	return obs.Running, obs.Alive
 }
 
 func commitStartResult(
