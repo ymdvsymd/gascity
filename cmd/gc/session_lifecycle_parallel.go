@@ -221,14 +221,18 @@ func (p startPhaseTimings) formatLog() string {
 }
 
 type startExecutionOptions struct {
-	async           bool
-	asyncFollowUp   func()
-	asyncLimiter    *asyncStartLimiter
-	asyncTracker    *asyncStartTracker
-	maxSessionAgeTr maxSessionAgeTracker
+	async            bool
+	asyncFollowUp    func()
+	asyncLimiter     *asyncStartLimiter
+	asyncTracker     *asyncStartTracker
+	asyncStopTracker *asyncStartTracker
+	maxSessionAgeTr  maxSessionAgeTracker
+	workDirResolver  taskWorkDirResolver
 }
 
 type startExecutionOption func(*startExecutionOptions)
+
+type taskWorkDirResolver func(startCandidate, *config.City) string
 
 func withAsyncStartExecution() startExecutionOption {
 	return func(opts *startExecutionOptions) {
@@ -254,6 +258,12 @@ func withAsyncStartTracker(tracker *asyncStartTracker) startExecutionOption {
 	}
 }
 
+func withAsyncDrainAckStopTracker(tracker *asyncStartTracker) startExecutionOption {
+	return func(opts *startExecutionOptions) {
+		opts.asyncStopTracker = tracker
+	}
+}
+
 // withMaxSessionAgeTracker installs the preemptive-restart tracker for
 // this reconcile pass. Nil leaves preemptive restarts disabled.
 func withMaxSessionAgeTracker(tr maxSessionAgeTracker) startExecutionOption {
@@ -262,10 +272,17 @@ func withMaxSessionAgeTracker(tr maxSessionAgeTracker) startExecutionOption {
 	}
 }
 
+func withTaskWorkDirResolver(resolver taskWorkDirResolver) startExecutionOption {
+	return func(opts *startExecutionOptions) {
+		opts.workDirResolver = resolver
+	}
+}
+
 type asyncStartTracker struct {
-	mu       sync.Mutex
-	wg       sync.WaitGroup
-	stopping bool
+	mu               sync.Mutex
+	wg               sync.WaitGroup
+	stopping         bool
+	drainAckStopKeys sync.Map
 }
 
 func (t *asyncStartTracker) start() (func(), bool) {
@@ -279,6 +296,28 @@ func (t *asyncStartTracker) start() (func(), bool) {
 	}
 	t.wg.Add(1)
 	return t.wg.Done, true
+}
+
+func (t *asyncStartTracker) startDrainAckStop(key string) (func(), bool) {
+	if t == nil {
+		return func() {}, true
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return t.start()
+	}
+	if _, loaded := t.drainAckStopKeys.LoadOrStore(key, struct{}{}); loaded {
+		return nil, false
+	}
+	done, ok := t.start()
+	if !ok {
+		t.drainAckStopKeys.Delete(key)
+		return nil, false
+	}
+	return func() {
+		t.drainAckStopKeys.Delete(key)
+		done()
+	}, true
 }
 
 func (t *asyncStartTracker) wait(timeout time.Duration) bool {
@@ -631,7 +670,7 @@ func prepareStartCandidate(
 	store beads.Store,
 	clk clock.Clock,
 ) (*preparedStart, error) {
-	return prepareStartCandidateForCity(candidate, "", "", cfg, nil, store, clk, io.Discard)
+	return prepareStartCandidateForCity(candidate, "", "", cfg, nil, store, clk, io.Discard, nil)
 }
 
 func prepareStartCandidateForCity(
@@ -643,6 +682,7 @@ func prepareStartCandidateForCity(
 	store beads.Store,
 	clk clock.Clock,
 	stderr io.Writer,
+	workDirResolver taskWorkDirResolver,
 ) (*preparedStart, error) {
 	session := candidate.session
 	if session != nil && strings.TrimSpace(session.ID) != "" && store != nil {
@@ -661,7 +701,7 @@ func prepareStartCandidateForCity(
 		return nil, err
 	}
 	candidate = refreshConfiguredNamedStartCandidate(candidate, cityPath, cityName, cfg, sp, store, clk, stderr)
-	return buildPreparedStart(candidate, cfg, store)
+	return buildPreparedStartWithWorkDirResolver(candidate, cfg, store, workDirResolver)
 }
 
 func refreshConfiguredNamedStartCandidate(
@@ -702,6 +742,15 @@ func buildPreparedStart(
 	candidate startCandidate,
 	cfg *config.City,
 	store beads.Store,
+) (*preparedStart, error) {
+	return buildPreparedStartWithWorkDirResolver(candidate, cfg, store, nil)
+}
+
+func buildPreparedStartWithWorkDirResolver(
+	candidate startCandidate,
+	cfg *config.City,
+	store beads.Store,
+	workDirResolver taskWorkDirResolver,
 ) (*preparedStart, error) {
 	session := candidate.session
 	tp := candidate.tp
@@ -751,7 +800,7 @@ func buildPreparedStart(
 	coreHash := runtime.CoreFingerprint(agentCfg)
 	coreBreakdown := runtime.CoreFingerprintBreakdown(agentCfg)
 	liveHash := runtime.LiveFingerprint(agentCfg)
-	if wd := resolveTaskWorkDir(store, session.ID, candidate.name(), strings.TrimSpace(session.Metadata["alias"]), candidate.logicalTemplate(cfg)); wd != "" {
+	if wd := resolvePreparedTaskWorkDir(candidate, cfg, store, workDirResolver); wd != "" {
 		agentCfg.WorkDir = wd
 	} else if wd := session.Metadata["work_dir"]; wd != "" {
 		agentCfg.WorkDir = wd
@@ -855,6 +904,33 @@ func buildPreparedStart(
 		coreBreakdown: coreBreakdown,
 		liveHash:      liveHash,
 	}, nil
+}
+
+func resolvePreparedTaskWorkDir(
+	candidate startCandidate,
+	cfg *config.City,
+	store beads.Store,
+	workDirResolver taskWorkDirResolver,
+) string {
+	if workDirResolver != nil {
+		if workDir := workDirResolver(candidate, cfg); workDir != "" {
+			return workDir
+		}
+	}
+	return resolveTaskWorkDir(store, taskWorkDirAssignees(candidate, cfg)...)
+}
+
+func taskWorkDirAssignees(candidate startCandidate, cfg *config.City) []string {
+	if candidate.session == nil {
+		return nil
+	}
+	session := candidate.session
+	return []string{
+		session.ID,
+		candidate.name(),
+		strings.TrimSpace(session.Metadata["alias"]),
+		candidate.logicalTemplate(cfg),
+	}
 }
 
 func executePreparedStartWave(
@@ -1928,7 +2004,7 @@ func executePlannedStartsTraced(
 						}
 					}
 				}
-				item, err := prepareStartCandidateForCity(candidate, cityPath, cityName, cfg, sp, store, clk, stderr)
+				item, err := prepareStartCandidateForCity(candidate, cityPath, cityName, cfg, sp, store, clk, stderr, startOpts.workDirResolver)
 				if err != nil {
 					clearPendingStartInFlightLease(candidate.session, store, stderr)
 					if release != nil {
