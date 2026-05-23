@@ -1487,6 +1487,227 @@ func TestOrderTrackingSweepWatchdogOnlyClosesSweepOrderTracking(t *testing.T) {
 	}
 }
 
+func TestOrderTrackingSweepWatchdogAllowsSweepOrderToCleanStaleTracking(t *testing.T) {
+	store := beads.NewMemStore()
+	sweepTracking, err := store.Create(beads.Bead{
+		Title:     "order:" + orderTrackingSweepOrder,
+		Labels:    []string{"order-run:" + orderTrackingSweepOrder, labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(sweep): %v", err)
+	}
+	staleMerge, err := store.Create(beads.Bead{
+		Title:     "order:pr-merge-queue",
+		Labels:    []string{"order-run:pr-merge-queue", labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(stale merge): %v", err)
+	}
+
+	cr := &CityRuntime{
+		cityName:            "test-city",
+		cfg:                 &config.City{Workspace: config.Workspace{Name: "test-city"}},
+		standaloneCityStore: store,
+		stdout:              io.Discard,
+		stderr:              io.Discard,
+		logPrefix:           "gc test",
+	}
+	cr.runOrderTrackingSweepWatchdog(sweepTracking.CreatedAt.Add(orderTrackingSweepWatchdogStaleAfter + time.Second))
+
+	if got, err := store.Get(sweepTracking.ID); err != nil {
+		t.Fatalf("Get(sweep): %v", err)
+	} else if got.Status != "closed" {
+		t.Fatalf("sweep tracking status = %s, want closed before dispatch", got.Status)
+	}
+
+	time.Sleep(75 * time.Millisecond)
+	freshMerge, err := store.Create(beads.Bead{
+		Title:     "order:pr-merge-queue",
+		Labels:    []string{"order-run:pr-merge-queue", labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(fresh merge): %v", err)
+	}
+
+	execRan := false
+	fakeExec := func(context.Context, string, string, []string) ([]byte, error) {
+		execRan = true
+		_, err := sweepStaleOrderTrackingAcrossStores(
+			[]beads.Store{store},
+			time.Now(),
+			50*time.Millisecond,
+			nil,
+			orderTrackingSweepMetadataInitiator,
+			false,
+		)
+		return nil, err
+	}
+	ad := buildOrderDispatcherFromListExec([]orders.Order{{
+		Name:     orderTrackingSweepOrder,
+		Trigger:  "cooldown",
+		Interval: "1ms",
+		Exec:     "gc order sweep-tracking",
+	}}, store, nil, fakeExec, nil)
+
+	ad.dispatch(context.Background(), t.TempDir(), time.Now().Add(time.Hour))
+	ad.drain(context.Background())
+	if !execRan {
+		t.Fatal("sweep order did not dispatch after watchdog closed its stale tracking bead")
+	}
+
+	gotStale, err := store.Get(staleMerge.ID)
+	if err != nil {
+		t.Fatalf("Get(stale merge): %v", err)
+	}
+	if gotStale.Status != "closed" {
+		t.Fatalf("stale merge tracking status = %s, want closed", gotStale.Status)
+	}
+	gotFresh, err := store.Get(freshMerge.ID)
+	if err != nil {
+		t.Fatalf("Get(fresh merge): %v", err)
+	}
+	if gotFresh.Status != "open" {
+		t.Fatalf("fresh merge tracking status = %s, want open", gotFresh.Status)
+	}
+}
+
+func TestOrderTrackingSweepWatchdogClosesRigStoreSweepTracking(t *testing.T) {
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+	rigSweepTracking, err := rigStore.Create(beads.Bead{
+		Title:     "order:" + orderTrackingSweepOrder + ":rig:frontend",
+		Labels:    []string{"order-run:" + orderTrackingSweepOrder + ":rig:frontend", labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(rig sweep): %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	freshRigSweepTracking, err := rigStore.Create(beads.Bead{
+		Title:     "order:" + orderTrackingSweepOrder + ":rig:frontend",
+		Labels:    []string{"order-run:" + orderTrackingSweepOrder + ":rig:frontend", labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(fresh rig sweep): %v", err)
+	}
+	cityTracking, err := cityStore.Create(beads.Bead{
+		Title:     "order:pr-merge-queue",
+		Labels:    []string{"order-run:pr-merge-queue", labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(city unrelated): %v", err)
+	}
+
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "frontend")
+	cr := &CityRuntime{
+		cityPath:            cityPath,
+		cityName:            "test-city",
+		cfg:                 &config.City{Workspace: config.Workspace{Name: "test-city"}, Rigs: []config.Rig{{Name: "frontend", Path: rigPath}}},
+		standaloneCityStore: cityStore,
+		standaloneRigStores: map[string]beads.Store{"frontend": rigStore},
+		stdout:              io.Discard,
+		stderr:              io.Discard,
+		logPrefix:           "gc test",
+	}
+	cr.runOrderTrackingSweepWatchdog(rigSweepTracking.CreatedAt.Add(orderTrackingSweepWatchdogStaleAfter + time.Millisecond))
+
+	gotRig, err := rigStore.Get(rigSweepTracking.ID)
+	if err != nil {
+		t.Fatalf("Get(rig sweep): %v", err)
+	}
+	if gotRig.Status != "closed" {
+		t.Fatalf("rig sweep tracking status = %s, want closed", gotRig.Status)
+	}
+	gotFresh, err := rigStore.Get(freshRigSweepTracking.ID)
+	if err != nil {
+		t.Fatalf("Get(fresh rig sweep): %v", err)
+	}
+	if gotFresh.Status != "open" {
+		t.Fatalf("fresh rig sweep tracking status = %s, want open", gotFresh.Status)
+	}
+	gotCity, err := cityStore.Get(cityTracking.ID)
+	if err != nil {
+		t.Fatalf("Get(city unrelated): %v", err)
+	}
+	if gotCity.Status != "open" {
+		t.Fatalf("city unrelated tracking status = %s, want open", gotCity.Status)
+	}
+}
+
+func TestOrderTrackingSweepWatchdogFallsBackToConfiguredRigStore(t *testing.T) {
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+	citySweepTracking, err := cityStore.Create(beads.Bead{
+		Title:     "order:" + orderTrackingSweepOrder,
+		Labels:    []string{"order-run:" + orderTrackingSweepOrder, labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(city sweep): %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	rigSweepTracking, err := rigStore.Create(beads.Bead{
+		Title:     "order:" + orderTrackingSweepOrder + ":rig:frontend",
+		Labels:    []string{"order-run:" + orderTrackingSweepOrder + ":rig:frontend", labelOrderTracking},
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(rig sweep): %v", err)
+	}
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "frontend")
+	prevOpenSweepStore := newCityRuntimeOpenSweepStore
+	newCityRuntimeOpenSweepStore = func(scopeRoot, gotCityPath string) (beads.Store, error) {
+		if gotCityPath != cityPath {
+			return nil, fmt.Errorf("city path = %q, want %q", gotCityPath, cityPath)
+		}
+		switch filepath.Clean(scopeRoot) {
+		case filepath.Clean(cityPath):
+			return cityStore, nil
+		case filepath.Clean(rigPath):
+			return rigStore, nil
+		default:
+			return nil, fmt.Errorf("unexpected store path %q", scopeRoot)
+		}
+	}
+	t.Cleanup(func() {
+		newCityRuntimeOpenSweepStore = prevOpenSweepStore
+	})
+
+	cr := &CityRuntime{
+		cityPath:            cityPath,
+		cityName:            "test-city",
+		cfg:                 &config.City{Workspace: config.Workspace{Name: "test-city"}, Rigs: []config.Rig{{Name: "frontend", Path: rigPath}}},
+		standaloneCityStore: cityStore,
+		standaloneRigStores: map[string]beads.Store{},
+		stdout:              io.Discard,
+		stderr:              io.Discard,
+		logPrefix:           "gc test",
+	}
+	cr.runOrderTrackingSweepWatchdog(rigSweepTracking.CreatedAt.Add(orderTrackingSweepWatchdogStaleAfter + time.Millisecond))
+
+	gotRig, err := rigStore.Get(rigSweepTracking.ID)
+	if err != nil {
+		t.Fatalf("Get(rig sweep): %v", err)
+	}
+	if gotRig.Status != "closed" {
+		t.Fatalf("rig sweep tracking status = %s, want closed", gotRig.Status)
+	}
+	gotCity, err := cityStore.Get(citySweepTracking.ID)
+	if err != nil {
+		t.Fatalf("Get(city sweep): %v", err)
+	}
+	if gotCity.Status != "closed" {
+		t.Fatalf("city sweep tracking status = %s, want closed", gotCity.Status)
+	}
+}
+
 func TestCityRuntimeDemandSnapshotRefreshesWhenDemandCommandsAreCustom(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -5485,4 +5706,110 @@ func TestCityRuntimeReloadAcceptNotBlockedBySlowTick(t *testing.T) {
 
 	cancel()
 	<-acceptDone
+}
+
+func TestCityRuntimeRunEmitsStartupPhaseTimingLogs(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stderr := &lockedWriter{w: &bytes.Buffer{}}
+	cr := newCityRuntime(CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:      newDrainOps(sp),
+		Rec:       events.Discard,
+		OnStarted: func() { cancel() },
+		Stdout:    io.Discard,
+		Stderr:    stderr,
+	})
+
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+
+	cr.run(ctx)
+
+	out := stderr.w.(*bytes.Buffer).String()
+	wantPhases := []string{"adoption-barrier", "config-reload", "startup-orders", "startup", "convergence-startup"}
+	for _, phase := range wantPhases {
+		marker := "startup phase=" + phase + " elapsed="
+		if !strings.Contains(out, marker) {
+			t.Errorf("stderr missing %q phase timing log\nstderr:\n%s", marker, out)
+		}
+	}
+	if !strings.Contains(out, "startup ready elapsed=") {
+		t.Errorf("stderr missing %q ready summary\nstderr:\n%s", "startup ready elapsed=", out)
+	}
+}
+
+func TestCityRuntimeStartupWatchdogDumpsGoroutinesOnSlowStartup(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	// Force the watchdog to fire well before BuildFn completes.
+	cfg.Daemon.StartReadyTimeout = "100ms"
+
+	sp := runtime.NewFake()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stderr := &lockedWriter{w: &bytes.Buffer{}}
+	var sleepOnce sync.Once
+	cr := newCityRuntime(CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			sleepOnce.Do(func() {
+				// Sleep past startReadyTimeout/2 (50ms) so the watchdog
+				// fires, but cap at a small bound so the test stays fast.
+				select {
+				case <-time.After(250 * time.Millisecond):
+				case <-ctx.Done():
+				}
+			})
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:      newDrainOps(sp),
+		Rec:       events.Discard,
+		OnStarted: func() { cancel() },
+		Stdout:    io.Discard,
+		Stderr:    stderr,
+	})
+
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+
+	cr.run(ctx)
+
+	out := stderr.w.(*bytes.Buffer).String()
+	if !strings.Contains(out, "startup watchdog") {
+		t.Fatalf("stderr missing %q watchdog warning\nstderr:\n%s", "startup watchdog", out)
+	}
+	if !strings.Contains(out, "goroutine dump follows") {
+		t.Fatalf("stderr missing goroutine dump marker\nstderr:\n%s", out)
+	}
 }
