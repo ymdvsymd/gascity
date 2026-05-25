@@ -934,6 +934,142 @@ func TestDoSlingNudgePoolMember(t *testing.T) {
 	}
 }
 
+func TestDoSlingNudgePoolMemberUsesBeadDerivedSessionName(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	const sessionName = "gm-glz06f"
+	if err := sp.Start(context.Background(), sessionName, runtime.Config{}); err != nil {
+		t.Fatalf("Start(%q): %v", sessionName, err)
+	}
+	sp.WaitForIdleErrors[sessionName] = nil
+	sp.Calls = nil
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name: "polecat",
+			Dir:  "hw",
+		}},
+	}
+	a := cfg.Agents[0]
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	deps.CityPath = t.TempDir()
+	store := newSlingTestStore()
+	deps.Store = store
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "pool session",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":      "hw/polecat",
+			"agent_name":    "hw/polecat",
+			"provider_kind": "claude",
+			"session_name":  sessionName,
+			"pool_slot":     "7",
+			"state":         "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(session bead): %v", err)
+	}
+
+	opts := testOpts(a, "BL-1")
+	opts.Nudge = true
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0; stderr: %s", code, stderr.String())
+	}
+	for _, c := range sp.Calls {
+		if (c.Method == "Nudge" || c.Method == "NudgeNow") && c.Name == sessionName {
+			if !strings.Contains(stdout.String(), "Nudged hw/polecat") {
+				t.Fatalf("stdout = %q, want delivered nudge confirmation", stdout.String())
+			}
+			if strings.Contains(stdout.String(), "No running sessions") || strings.Contains(stderr.String(), "poke failed") {
+				t.Fatalf("stdout=%q stderr=%q, want no controller wake fallback", stdout.String(), stderr.String())
+			}
+			updated, err := store.Get(sessionBead.ID)
+			if err != nil {
+				t.Fatalf("Get(session bead): %v", err)
+			}
+			if got := updated.Metadata["last_nudge_delivered_at"]; got == "" {
+				t.Fatalf("last_nudge_delivered_at = %q, want delivered nudge stamp", got)
+			}
+			return
+		}
+	}
+	t.Fatalf("runtime calls = %+v, want Nudge/NudgeNow on bead-derived session %q", sp.Calls, sessionName)
+}
+
+func TestDoSlingNudgePoolUsesCityStoreForSessionBeads(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	sessionName := "workflows__codex-max-mc-session-test"
+	if err := sp.Start(context.Background(), sessionName, runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	sp.Calls = nil
+	a := config.Agent{
+		Name:        "codex-max",
+		Dir:         "gascity",
+		BindingName: "workflows",
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{a},
+	}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	deps.CityPath = t.TempDir()
+	writeSlingTestCity(t, deps.CityPath, "[workspace]\nname = \"test-city\"\n")
+	cityStore := beads.NewMemStore()
+	if _, err := cityStore.Create(beads.Bead{
+		Title:  "gascity/workflows.codex-max-8",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "gascity/workflows.codex-max",
+			"session_name": sessionName,
+			"pool_slot":    "8",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prevOpen := slingOpenCityStore
+	slingOpenCityStore = func(path string) (beads.Store, error) {
+		if path != deps.CityPath {
+			t.Fatalf("slingOpenCityStore(%q), want %q", path, deps.CityPath)
+		}
+		return cityStore, nil
+	}
+	t.Cleanup(func() { slingOpenCityStore = prevOpen })
+	prevPoller := startNudgePoller
+	startNudgePoller = func(_, _, _ string) error { return nil }
+	t.Cleanup(func() { startNudgePoller = prevPoller })
+
+	doSlingNudge(&a, deps.CityName, deps.CityPath, cfg, sp, deps.Store, stdout, stderr)
+	if strings.Contains(stdout.String(), "No running sessions") || strings.Contains(stderr.String(), "poke failed") {
+		t.Fatalf("sling nudge missed live city-store pool session; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if stderr.Len() > 0 {
+		t.Fatalf("stderr = %q, want no warning", stderr.String())
+	}
+	var observedLiveSession bool
+	for _, call := range sp.Calls {
+		if call.Method == "IsRunning" && call.Name == sessionName {
+			observedLiveSession = true
+			break
+		}
+	}
+	if !observedLiveSession {
+		t.Fatalf("runtime calls = %#v, want IsRunning for city-store session %q", sp.Calls, sessionName)
+	}
+	if !strings.Contains(stdout.String(), "gascity/workflows.codex-max-8") {
+		t.Fatalf("stdout = %q, want nudge output for city-store pool instance", stdout.String())
+	}
+}
+
 func TestDoSlingNudgePoolNoMembers(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()

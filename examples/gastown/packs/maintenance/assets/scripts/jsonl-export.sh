@@ -29,6 +29,8 @@ SPIKE_THRESHOLD="${GC_JSONL_SPIKE_THRESHOLD:-20}"  # percentage (0-100)
 # this absolute floor — small-N percentages are noise. Set to 0 to disable.
 MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-10}"
 MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
+PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
+PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
 SCRUB="${GC_JSONL_SCRUB:-true}"
 ARCHIVE_REPO="${GC_JSONL_ARCHIVE_REPO:-$PACK_STATE_DIR/jsonl-archive}"
 
@@ -39,6 +41,11 @@ ARCHIVE_REPO="${GC_JSONL_ARCHIVE_REPO:-$PACK_STATE_DIR/jsonl-archive}"
 # instead of being silently scored as zero rows.
 count_jsonl_rows() {
     jq -s -r 'if length == 0 then 0 else ((.[0].rows // []) | length) end' || echo "0"
+}
+
+push_retry_delay_seconds() {
+    awk -v seed="$RANDOM$$" -v min="$PUSH_RETRY_DELAY_MIN" -v span="$PUSH_RETRY_DELAY_SPAN" \
+        'BEGIN{srand(seed); printf "%.2f", min + rand() * span}'
 }
 
 # Scrub test-only rows and ephemeral system rows while preserving the JSON
@@ -474,6 +481,8 @@ push_archive_main() {
     local fetch_err
     local rebase_err
     local push_err
+    local push_attempt
+    local push_succeeded
 
     # Retain only the last ~20 lines of stderr so an extremely chatty failure
     # doesn't drown the escalation body.
@@ -569,9 +578,47 @@ ESCALATION
         fi
     fi
 
-    if ! push_err=$(git push origin main -q 2>&1 >/dev/null); then
+    # Retry-with-backoff for transient push failures. Concurrent rigs pushing
+    # to the same local bare archive can race on the ref-update lock or produce
+    # non-fast-forward (a sibling rig commits between our fetch and our push).
+    # Retry up to 3 times with jitter; re-fetch and rebase before each retry to
+    # absorb any new commits. Delay bounds default to 1-5s and are overridden
+    # in tests to keep failure-path coverage fast.
+    push_succeeded=false
+    for push_attempt in 1 2 3; do
+        if push_err=$(git push origin main -q 2>&1 >/dev/null); then
+            push_succeeded=true
+            if [ "$push_attempt" -gt 1 ]; then
+                echo "jsonl-export: push succeeded on retry attempt $push_attempt" >&2
+            fi
+            break
+        fi
+
+        if [ "$push_attempt" -lt 3 ]; then
+            sleep "$(push_retry_delay_seconds)"
+
+            # Refresh origin tracking before retry — a sibling rig may have
+            # moved the ref while we slept.
+            if fetch_err=$(git fetch origin main -q 2>&1 >/dev/null); then
+                if git rev-parse --verify refs/remotes/origin/main >/dev/null 2>&1 \
+                    && ! git merge-base --is-ancestor refs/remotes/origin/main HEAD >/dev/null 2>&1; then
+                    if ! rebase_err=$(git rebase refs/remotes/origin/main 2>&1 >/dev/null); then
+                        git rebase --abort >/dev/null 2>&1 || true
+                        record_archive_push_failure \
+                            "jsonl-export: rebase onto origin/main failed during retry $push_attempt" \
+                            "$rebase_err"
+                        return 1
+                    fi
+                fi
+            fi
+            # If fetch failed, fall through and retry the push anyway —
+            # origin may just be momentarily unavailable.
+        fi
+    done
+
+    if [ "$push_succeeded" != "true" ]; then
         record_archive_push_failure \
-            "jsonl-export: pushing archive main failed" \
+            "jsonl-export: pushing archive main failed after 3 attempts" \
             "$push_err"
         return 1
     fi
@@ -726,6 +773,56 @@ valid_database_identifier() {
     return 0
 }
 
+read_source_issue_count() {
+    local db="$1"
+    local output
+    local count
+
+    if ! output=$(dolt_sql -r csv -q "SELECT COUNT(*) AS row_count FROM \`$db\`.issues $SCRUB_FILTER" 2>/dev/null); then
+        return 1
+    fi
+    count=$(printf '%s\n' "$output" | tail -n 1 | tr -d '\r')
+    case "$count" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$count"
+}
+
+should_halt_for_jsonl_spike() {
+    local db="$1"
+    local prev_count="$2"
+    local current_count="$3"
+    local threshold="$4"
+    local source_count
+    local source_drop
+
+    # Growth spikes are still suspicious. Only drop spikes can be suppressed by
+    # checking the Dolt source-of-truth behind the passive JSONL export.
+    if [ "$current_count" -ge "$prev_count" ]; then
+        return 0
+    fi
+
+    if ! source_count=$(read_source_issue_count "$db"); then
+        echo "jsonl-export: source-of-truth count unavailable for $db; preserving JSONL spike halt" >&2
+        return 0
+    fi
+
+    if [ "$source_count" -ge "$prev_count" ]; then
+        echo "jsonl-export: suppressing JSONL drop spike for $db; source count $source_count >= previous $prev_count" >&2
+        return 1
+    fi
+
+    source_drop=$(( (prev_count - source_count) * 100 / prev_count ))
+    if [ "$source_drop" -le "$threshold" ]; then
+        echo "jsonl-export: suppressing JSONL drop spike for $db; source drop ${source_drop}% <= ${threshold}%" >&2
+        return 1
+    fi
+
+    return 0
+}
+
 while IFS= read -r DB; do
     [ -z "$DB" ] && continue
     TOTAL_DBS=$((TOTAL_DBS + 1))
@@ -846,7 +943,7 @@ while IFS= read -r DB; do
         if [ "$DELTA" -lt 0 ]; then
             DELTA=$(( -DELTA ))
         fi
-        if [ "$DELTA" -gt "$SPIKE_THRESHOLD" ]; then
+        if [ "$DELTA" -gt "$SPIKE_THRESHOLD" ] && should_halt_for_jsonl_spike "$DB" "$PREV_COUNT" "$FILTERED_COUNT" "$SPIKE_THRESHOLD"; then
             HALTED=1
             HALT_DB="$DB"
             HALT_PREV_COUNT="$PREV_COUNT"
