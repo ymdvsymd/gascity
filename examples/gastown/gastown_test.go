@@ -535,14 +535,14 @@ func TestPolecatFormulaSignalsRefineryAfterReassign(t *testing.T) {
 	nudge := `gc session nudge "$REFINERY_TARGET" "Run 'gc prime' to check merge queue and begin processing." || true`
 
 	assertContainsInOrder(t, body,
-		"**5. Reassign to refinery:**",
+		"**6. Reassign to refinery:**",
 		refineryTarget,
 		`gc bd update {{issue}} --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""`,
-		"**6. Signal refinery to check for work immediately",
+		"**7. Signal refinery to check for work immediately",
 		refineryTarget,
 		`gc session wake "$REFINERY_TARGET" || true`,
 		nudge,
-		"**7. Signal reconciler and exit.**",
+		"**8. Signal reconciler and exit.**",
 	)
 
 	for _, bad := range []string{
@@ -557,6 +557,70 @@ func TestPolecatFormulaSignalsRefineryAfterReassign(t *testing.T) {
 	if strings.Contains(body, `--assignee="$REFINERY_TARGET" --set-metadata gc.routed_to="$REFINERY_TARGET"`) {
 		t.Fatal("polecat formula must clear gc.routed_to instead of routing to the refinery named session")
 	}
+}
+
+// TestPolecatFormulaSubmitHasBranchShapeGate is the regression test
+// for gastownhall/gascity#2082: the submit-and-exit step must include
+// a fail-closed gate that refuses to reassign to refinery when the
+// current branch isn't `polecat/<bead-id>`. Without this gate, a
+// provider that skipped workspace-setup (observed with codex)
+// silently strands work on its agent home branch — metadata.branch
+// never points at a valid polecat/<bead-id> merge target, so the
+// refinery's bead-driven handoff finds nothing to merge.
+func TestPolecatFormulaSubmitHasBranchShapeGate(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "formulas", "mol-polecat-work.toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading polecat formula: %v", err)
+	}
+	body := string(data)
+
+	// The gate body must appear before the push (so a divergent
+	// branch never reaches origin) and before the refinery reassign
+	// (so a divergent branch never advances the bead state).
+	assertContainsInOrder(t, body,
+		"**1. Branch-shape gate (fails closed",
+		`CURRENT_BRANCH=$(git branch --show-current)`,
+		`EXPECTED_BRANCH="polecat/{{issue}}"`,
+		`if [ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" ]; then`,
+		`BRANCH SHAPE GATE FAILED`,
+		`gc runtime drain-ack`,
+		`exit 1`,
+		"**2. Final clean-state verification (safeguard):**",
+		"**3. Push your branch:**",
+		"**6. Reassign to refinery:**",
+	)
+
+	// The metadata.branch reconciliation must also be present so a
+	// workspace-setup step that ran but failed to record the branch
+	// is repaired before refinery handoff.
+	assertContainsInOrder(t, body,
+		`METADATA_BRANCH=$(gc bd show {{issue}} --json | jq -r '.[0].metadata.branch // empty')`,
+		`gc bd update {{issue}} --set-metadata branch="$EXPECTED_BRANCH"`,
+	)
+}
+
+// TestPolecatPromptInlinesBranchConvention asserts the polecat agent
+// prompt embeds the polecat/<bead-id> convention verbatim in a
+// CRITICAL section, so a provider that skips reading the formula
+// (observed with codex on #2082) still sees the rule inline.
+func TestPolecatPromptInlinesBranchConvention(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "agents", "polecat", "prompt.template.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading polecat prompt: %v", err)
+	}
+	body := string(data)
+
+	assertContainsInOrder(t, body,
+		"## CRITICAL: Branch Convention",
+		"`polecat/<bead-id>`",
+		"`metadata.branch`",
+		"handoff contract is broken",
+		"gastownhall/gascity#2082",
+	)
 }
 
 func TestPolecatFormulaSelfReviewRendersAffectedTestModes(t *testing.T) {
@@ -635,6 +699,98 @@ func TestPolecatPromptDoneSequenceSignalsRefinery(t *testing.T) {
 	if !strings.Contains(body, "Done sequence (push, set metadata, reassign, wake refinery, nudge refinery, `gc runtime drain-ack`, exit)") {
 		t.Fatalf("polecat quick reference must include the refinery wake+nudge handoff")
 	}
+}
+
+// TestPolecatPromptHaltsOnAutoPushFalse asserts the done sequence respects
+// mol-pr-from-issue's auto_push=false halt-at-branch-ready contract. The
+// gate must run BEFORE `git push origin HEAD` so a false signal prevents
+// the push and refinery handoff entirely. Regression for gco-ded / gc-m3j:
+// prompt's done sequence was structurally overriding the formula's
+// auto_push gate (BYPASS rate hit 75%).
+func TestPolecatPromptHaltsOnAutoPushFalse(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "agents", "polecat", "prompt.template.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading polecat prompt: %v", err)
+	}
+	body := string(data)
+
+	assertContainsInOrder(t, body,
+		"## FINAL REMINDER: RUN THE DONE SEQUENCE",
+		`AUTO_PUSH=$(gc bd show <work-bead> --json | jq -r '.[0].metadata | if has("auto_push") then (.auto_push | tostring) else "" end')`,
+		`if [ "$AUTO_PUSH" = "false" ]; then`,
+		`BRANCH=$(git branch --show-current)`,
+		`gc bd update <work-bead> \`,
+		`--status=open --assignee=""`,
+		`--set-metadata branch="$BRANCH"`,
+		`--set-metadata target={{ .DefaultBranch }}`,
+		`--set-metadata branch_ready=true`,
+		`--set-metadata halt_reason=auto_push_false`,
+		`--set-metadata gc.routed_to=""`,
+		`gc runtime drain-ack`,
+		"exit 0",
+		"fi",
+		"git push origin HEAD",
+	)
+}
+
+func TestPolecatRenderedApprovalFallacyHaltsOnAutoPushFalse(t *testing.T) {
+	body := renderGastownPromptForPack(t,
+		"packs/gastown/agents/polecat/prompt.template.md",
+		"polecat",
+		"polecat",
+		"gascity",
+		"gastown",
+		"gastown.",
+	)
+	doneSequence := sectionBetween(t, body, "### The Done Sequence", "This pushes your branch")
+
+	assertContainsInOrder(t, doneSequence,
+		`AUTO_PUSH=$(gc bd show <work-bead> --json | jq -r '.[0].metadata | if has("auto_push") then (.auto_push | tostring) else "" end')`,
+		`if [ "$AUTO_PUSH" = "false" ]; then`,
+		`BRANCH=$(git branch --show-current)`,
+		`gc bd update <work-bead> \`,
+		`--status=open --assignee=""`,
+		`--set-metadata branch="$BRANCH"`,
+		`--set-metadata target=main`,
+		`--set-metadata branch_ready=true`,
+		`--set-metadata halt_reason=auto_push_false`,
+		`--set-metadata gc.routed_to=""`,
+		`gc runtime drain-ack`,
+		"exit 0",
+		"fi",
+		"git push origin HEAD",
+	)
+}
+
+func TestPolecatFormulaHaltsOnAutoPushFalse(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "formulas", "mol-polecat-work.toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading polecat formula: %v", err)
+	}
+	body := string(data)
+	submit := sectionBetween(t, body, `id = "submit-and-exit"`, "The refinery will pick this up")
+
+	assertContainsInOrder(t, submit,
+		"**2. Push your branch:**",
+		`AUTO_PUSH=$(gc bd show {{issue}} --json | jq -r '.[0].metadata | if has("auto_push") then (.auto_push | tostring) else "" end')`,
+		`if [ "$AUTO_PUSH" = "false" ]; then`,
+		`BRANCH=$(git branch --show-current)`,
+		`gc bd update {{issue}} \`,
+		`--status=open --assignee=""`,
+		`--set-metadata branch="$BRANCH"`,
+		`--set-metadata target={{base_branch}}`,
+		`--set-metadata branch_ready=true`,
+		`--set-metadata halt_reason=auto_push_false`,
+		`--set-metadata gc.routed_to=""`,
+		`gc runtime drain-ack`,
+		"exit 0",
+		"fi",
+		"git push origin HEAD",
+	)
 }
 
 func TestRefineryFormulaRespectsExistingPRMetadata(t *testing.T) {
