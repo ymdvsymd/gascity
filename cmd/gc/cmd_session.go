@@ -1226,7 +1226,10 @@ func buildAttachmentCache(sessions []session.Info, observe ...func(session.Info)
 	return cache
 }
 
-const resetPendingReason = "reset-pending"
+const (
+	resetPendingReason = session.LifecycleReasonResetPending
+	circuitOpenReason  = session.LifecycleReasonCircuitOpen
+)
 
 // sessionReason computes the REASON column for a session in gc session list.
 // For awake sessions, shows wake reasons (e.g., "config", "attached").
@@ -1251,12 +1254,16 @@ func sessionReason(s session.Info, beadIndex map[string]beads.Bead, cfg *config.
 	if lifecycle.BaseState == session.BaseStateArchived && !lifecycle.ContinuityEligible {
 		return "-"
 	}
-	if resetPendingReasonVisible(s, b, sp, now) {
-		return resetPendingReason
+	var isRunning func(string) bool
+	if sp != nil {
+		isRunning = sp.IsRunning
+	}
+	if reason := session.LifecycleDisplayReasonWithLiveness(b.Status, b.Metadata, now, s.SessionName, isRunning); reason != "" {
+		return reason
 	}
 
-	// If config is available, compute full wake reasons (including WakeConfig).
-	// Otherwise, only bead metadata (sleep/hold/quarantine) is shown.
+	// If config is available and no lifecycle reason blocks display, compute
+	// full wake reasons (including WakeConfig).
 	if cfg != nil {
 		reasons := wakeReasons(b, cfg, sp, poolDesired, nil, readyWaitSet, clock.Real{})
 		if pinAwakeWakeReasonVisible(b, cfg, time.Now().UTC()) && !containsWakeReason(reasons, WakePin) {
@@ -1271,21 +1278,7 @@ func sessionReason(s session.Info, beadIndex map[string]beads.Bead, cfg *config.
 		}
 	}
 
-	// No wake reasons (or no config) — show why it's asleep from lifecycle metadata.
-	if reason := session.LifecycleDisplayReason(b.Status, b.Metadata, now); reason != "" {
-		return reason
-	}
 	return "-"
-}
-
-// resetPendingReasonVisible keeps the fallback renderer aligned with the API
-// lifecycle reason rules for live reset requests.
-func resetPendingReasonVisible(s session.Info, b beads.Bead, sp runtime.Provider, now time.Time) bool {
-	var isRunning func(string) bool
-	if sp != nil {
-		isRunning = sp.IsRunning
-	}
-	return session.LifecycleResetPendingReasonVisible(b.Status, b.Metadata, now, s.SessionName, isRunning)
 }
 
 func pinAwakeWakeReasonVisible(b beads.Bead, cfg *config.City, now time.Time) bool {

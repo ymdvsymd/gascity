@@ -655,6 +655,8 @@ type AgentOverride struct {
 	ResumeCommand *string `toml:"resume_command,omitempty"`
 	// WakeMode overrides the agent's wake mode ("resume" or "fresh").
 	WakeMode *string `toml:"wake_mode,omitempty" jsonschema:"enum=resume,enum=fresh"`
+	// MouseMode overrides whether tmux mouse mode is preserved ("on" or "off").
+	MouseMode *string `toml:"mouse_mode,omitempty" jsonschema:"enum=on,enum=off"`
 	// InjectFragmentsAppend appends to the agent's inject_fragments list.
 	InjectFragmentsAppend []string `toml:"inject_fragments_append,omitempty"`
 	// MaxActiveSessions overrides the agent-level cap on concurrent sessions.
@@ -1598,6 +1600,26 @@ func (c ChatSessionsConfig) IdleTimeoutDuration() time.Duration {
 	return d
 }
 
+// LocalDoctorCheck is a city-local doctor check declared inline in city.toml
+// via [[doctor.check]]. Scripts use the same exit-code protocol as pack
+// doctor scripts: 0=OK, 1=Warning, 2+=Error.
+type LocalDoctorCheck struct {
+	// Name is the bare check name. The SDK injects the "local:" prefix;
+	// do not include it here.
+	Name string `toml:"name"`
+
+	// Script is the path to the check script, relative to the city root.
+	// Execution registration enforces containment within the city directory.
+	Script string `toml:"script"`
+
+	// Description is optional human-readable text shown in verbose output.
+	Description string `toml:"description,omitempty"`
+
+	// Fix is the optional path to a remediation script, relative to the
+	// city root.
+	Fix string `toml:"fix,omitempty"`
+}
+
 // DoctorConfig holds settings for the gc doctor surface. Operator-tunable
 // thresholds and policy toggles live here; mechanical structural checks
 // (broken-worktree pointers, missing files) remain hardcoded since they
@@ -1623,6 +1645,10 @@ type DoctorConfig struct {
 	// enforced by mechanical checks (no uncommitted changes, no
 	// unpushed commits, no stashes) — never by role identity.
 	NestedWorktreePrune bool `toml:"nested_worktree_prune,omitempty" jsonschema:"default=false"`
+
+	// Checks holds city-local inline doctor checks declared via
+	// [[doctor.check]] in city.toml.
+	Checks []LocalDoctorCheck `toml:"check,omitempty"`
 }
 
 const (
@@ -2453,6 +2479,11 @@ type Agent struct {
 	// "resume" (default): reuse provider session key for conversation continuity.
 	// "fresh": start a new provider session on every wake (polecat pattern).
 	WakeMode string `toml:"wake_mode,omitempty" jsonschema:"enum=resume,enum=fresh"`
+	// MouseMode controls whether tmux mouse mode is preserved for this agent.
+	// "on" leaves the session's mouse setting alone for human-attached
+	// sessions; "off" or empty preserves the SDK's default mouse-off startup
+	// behavior for headless sessions.
+	MouseMode string `toml:"mouse_mode,omitempty" jsonschema:"enum=on,enum=off"`
 	// SleepAfterIdleSource records which config layer supplied SleepAfterIdle.
 	// Runtime-only — not persisted to TOML or JSON.
 	SleepAfterIdleSource string `toml:"-" json:"-"`
@@ -2592,23 +2623,87 @@ func (a *Agent) EffectiveWakeMode() string {
 	return "resume"
 }
 
+// MouseModeOn reports whether tmux mouse mode should be preserved for this agent.
+func (a *Agent) MouseModeOn() bool {
+	return a.MouseMode == "on"
+}
+
 // AttachEnabled reports whether the agent supports interactive attachment.
 func (a *Agent) AttachEnabled() bool {
 	return a.Attach == nil || *a.Attach
 }
 
+// poolDemandKeys lists the routing metadata keys the pool-demand predicate
+// consults, in precedence order. gc.run_target — the canonical per-step
+// target stamped by the graph.v2 stamper (and, since #2386, the legacy
+// stamper) — is preferred; gc.routed_to is the compatibility fallback for
+// beads authored before the gc.run_target migration. The worker claim path
+// (EffectiveWorkQuery Tier 3) and the reconciler demand path
+// (EffectivePoolDemandQuery) walk these in the same order so that a graph.v2
+// workflow root stamping only gc.run_target is both spawned-for and
+// claimable (#2763 — completes the reader migration #2386 began;
+// bdReadyPoolDemandShell was the one reader site it missed).
+var poolDemandKeys = []string{"gc.run_target", "gc.routed_to"}
+
 // bdReadyPoolDemandShell returns the bd ready predicate for unassigned,
-// non-epic pool demand routed to target. This is the one-source-of-truth for the
-// "is there work on this routed queue?" question that both the worker (via
-// EffectiveWorkQuery Tier 3) and the reconciler (via EffectivePoolDemandQuery,
-// count-form) ask. Diverging the two re-introduces the protocol-mismatch class;
-// see the "scale_check ↔ work_query correspondence" note in
-// engdocs/architecture/dispatch.md.
+// non-epic pool demand matched on metadata field key=target. This is the
+// one-source-of-truth for the "is there work on this routed queue?" question
+// that both the worker (via EffectiveWorkQuery Tier 3) and the reconciler (via
+// EffectivePoolDemandQuery, count-form) ask. Diverging the two re-introduces
+// the protocol-mismatch class; see the "scale_check ↔ work_query
+// correspondence" note in engdocs/architecture/dispatch.md.
+//
+// bd ready cannot express a single "match key A or key B" predicate
+// (--metadata-field is AND-combined and there is no key-absent filter), so the
+// run_target/routed_to precedence is composed at the shell layer by
+// poolDemandFirstRowProbes (work_query) and poolDemandCountShell (count-form),
+// which call this helper once per key in poolDemandKeys order.
 //
 // Callers append their own bd flags (--limit=1 for first-row work_query;
-// piped to jq 'length' for the count-form) and shell handling.
-func bdReadyPoolDemandShell(target string) string {
-	return `bd ready --metadata-field gc.routed_to=` + target + ` --unassigned --exclude-type=epic --json`
+// --limit 0 piped to jq 'length' for the count-form) and shell handling.
+func bdReadyPoolDemandShell(key, target string) string {
+	return `bd ready --metadata-field ` + key + `=` + target + ` --unassigned --exclude-type=epic --json`
+}
+
+// poolDemandFirstRowProbes emits the work_query Tier 3 body for target: it
+// tries each routing key in poolDemandKeys precedence order at --limit=1,
+// printing the first non-empty JSON array and exiting 0. Used for both the
+// primary and legacy workflow-control targets. The caller appends a terminal
+// fallthrough (e.g. printf "[]") for the all-empty case.
+func poolDemandFirstRowProbes(target string) string {
+	var b strings.Builder
+	for _, key := range poolDemandKeys {
+		b.WriteString(`r=$(` + bdReadyPoolDemandShell(key, target) + ` --limit=1 2>/dev/null); `)
+		b.WriteString(`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `)
+	}
+	return b.String()
+}
+
+// poolDemandCountShell emits the reconciler count-form for target: it counts
+// ready demand under the first routing key in poolDemandKeys that yields a
+// non-empty result (gc.run_target preferred, gc.routed_to fallback) and prints
+// the array length. Precedence mirrors poolDemandFirstRowProbes so the
+// reconciler's spawn decision and the worker's claim decision agree — the
+// worker drains the preferred tier first, then the count surfaces the fallback
+// tier on the next pass.
+//
+// Unlike the work_query probes, this form must NOT redirect bd stderr or
+// default to zero: a failed `bd ready` has to surface as an error rather than
+// masquerade as "no demand", which would silently stop the pool from spawning.
+// Every query is chained with && so any non-zero bd exit short-circuits the
+// whole expression (TestEffectiveScaleCheckUsesReadyOnly).
+func poolDemandCountShell(target string) string {
+	keys := poolDemandKeys
+	last := len(keys) - 1
+	// Least-preferred key assigns unconditionally; its bd failure propagates
+	// through the outer &&.
+	expr := `ready_json=$(` + bdReadyPoolDemandShell(keys[last], target) + ` --limit 0)`
+	for i := last - 1; i >= 0; i-- {
+		query := bdReadyPoolDemandShell(keys[i], target) + ` --limit 0`
+		expr = `cur=$(` + query + `) && ` +
+			`if [ "$cur" != "[]" ]; then ready_json="$cur"; else ` + expr + `; fi`
+	}
+	return expr + ` && printf '%s\n' "$ready_json" | jq 'length'`
 }
 
 func (a *Agent) poolDemandTarget() string {
@@ -2668,13 +2763,13 @@ func (a *Agent) EffectiveWorkQuery() string {
 			`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 			`done; ` +
 			// Tier 3: ready unassigned routed to this config (shared routed queue).
+			// Prefers gc.run_target, falls back to gc.routed_to (poolDemandKeys).
 			// Only ephemeral sessions and controller probes consume generic config demand.
 			`case "$GC_SESSION_ORIGIN" in ` +
 			`ephemeral|"") ;; ` +
 			`*) exit 0 ;; ` +
 			`esac; ` +
-			`r=$(` + bdReadyPoolDemandShell(target) + ` --limit=1 2>/dev/null); ` +
-			`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+			poolDemandFirstRowProbes(target) +
 			`printf "[]"'`
 	}
 	return `sh -c '` +
@@ -2701,15 +2796,16 @@ func (a *Agent) EffectiveWorkQuery() string {
 		`done; ` +
 		`done; ` +
 		// Tier 3: ready unassigned routed to this config (shared routed queue),
-		// then the legacy workflow-control route for pre-rename graphs.
+		// then the legacy workflow-control route for pre-rename graphs. Each
+		// target prefers gc.run_target, falling back to gc.routed_to (poolDemandKeys).
 		// Only ephemeral sessions and controller probes consume generic config demand.
 		`case "$GC_SESSION_ORIGIN" in ` +
 		`ephemeral|"") ;; ` +
 		`*) exit 0 ;; ` +
 		`esac; ` +
-		`r=$(` + bdReadyPoolDemandShell(target) + ` --limit=1 2>/dev/null); ` +
-		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		bdReadyPoolDemandShell(legacyTarget) + ` --limit=1 2>/dev/null'`
+		poolDemandFirstRowProbes(target) +
+		poolDemandFirstRowProbes(legacyTarget) +
+		`printf "[]"'`
 }
 
 func legacyWorkflowControlQualifiedName(target string) string {
@@ -2791,8 +2887,7 @@ func (a *Agent) EffectivePoolDemandQuery() string {
 		return a.ScaleCheck
 	}
 	target := a.poolDemandTarget()
-	return `ready_json=$(` + bdReadyPoolDemandShell(target) +
-		` --limit 0) && printf '%s\n' "$ready_json" | jq 'length'`
+	return poolDemandCountShell(target)
 }
 
 // EffectiveScaleCheck returns the scale check command for this agent.
@@ -3346,6 +3441,13 @@ func ValidateAgents(agents []Agent) error {
 		default:
 			return fmt.Errorf("agent %q: wake_mode must be \"resume\", \"fresh\", or empty, got %q", a.QualifiedName(), a.WakeMode)
 		}
+		// MouseMode enum.
+		switch a.MouseMode {
+		case "", "on", "off":
+			// valid
+		default:
+			return fmt.Errorf("agent %q: mouse_mode must be \"on\", \"off\", or empty, got %q", a.QualifiedName(), a.MouseMode)
+		}
 		if a.MinActiveSessions != nil && *a.MinActiveSessions < 0 {
 			return fmt.Errorf("agent %q: min_active_sessions must be >= 0", a.Name)
 		}
@@ -3602,8 +3704,8 @@ func WizardCity(name, provider, startCommand string) City {
 }
 
 // GastownCity returns a City configured for the gastown orchestration pack.
-// Agents come from the pack (.gc/system/packs/gastown); no inline agents are
-// defined. The root city pack imports gastown and sets canonical
+// Agents come from the public gastown pack; no inline agents are defined. The
+// root city pack imports gastown explicitly and sets canonical
 // DefaultRigImports so newly added rigs inherit the same pack by default. It
 // also sets global fragments and daemon config. If startCommand is set, it
 // takes precedence over provider.
@@ -3622,10 +3724,16 @@ func GastownCity(name, provider, startCommand string) City {
 	return City{
 		Workspace: ws,
 		Imports: map[string]Import{
-			"gastown": {Source: ".gc/system/packs/gastown"},
+			"gastown": {
+				Source:  PublicGastownPackSource,
+				Version: PublicGastownPackVersion,
+			},
 		},
 		DefaultRigImports: map[string]Import{
-			"gastown": {Source: ".gc/system/packs/gastown"},
+			"gastown": {
+				Source:  PublicGastownPackSource,
+				Version: PublicGastownPackVersion,
+			},
 		},
 		DefaultRigImportOrder: []string{"gastown"},
 		Daemon: DaemonConfig{

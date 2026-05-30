@@ -118,6 +118,7 @@ Agent defines a configured agent in the city.
 | `depends_on` | []string |  |  | DependsOn lists agent names that must be awake before this agent wakes. Used for dependency-ordered startup and shutdown. Validated for cycles at config load time. |
 | `resume_command` | string |  |  | ResumeCommand is the full shell command to run when resuming this agent. Supports &#123;&#123;.SessionKey&#125;&#125; template variable. When set, takes precedence over the provider's ResumeFlag/ResumeStyle. Example:   "claude --resume &#123;&#123;.SessionKey&#125;&#125; --dangerously-skip-permissions" |
 | `wake_mode` | string |  |  | WakeMode controls context freshness across sleep/wake cycles. "resume" (default): reuse provider session key for conversation continuity. "fresh": start a new provider session on every wake (polecat pattern). Enum: `resume`, `fresh` |
+| `mouse_mode` | string |  |  | MouseMode controls whether tmux mouse mode is preserved for this agent. "on" leaves the session's mouse setting alone for human-attached sessions; "off" or empty preserves the SDK's default mouse-off startup behavior for headless sessions. Enum: `on`, `off` |
 
 ## AgentDefaults
 
@@ -182,6 +183,7 @@ AgentOverride modifies a pack-stamped agent for a specific rig.
 | `depends_on` | []string |  |  | DependsOn overrides the agent's dependency list. |
 | `resume_command` | string |  |  | ResumeCommand overrides the agent's resume_command template. |
 | `wake_mode` | string |  |  | WakeMode overrides the agent's wake mode ("resume" or "fresh"). Enum: `resume`, `fresh` |
+| `mouse_mode` | string |  |  | MouseMode overrides whether tmux mouse mode is preserved ("on" or "off"). Enum: `on`, `off` |
 | `inject_fragments_append` | []string |  |  | InjectFragmentsAppend appends to the agent's inject_fragments list. |
 | `max_active_sessions` | integer |  |  | MaxActiveSessions overrides the agent-level cap on concurrent sessions. |
 | `min_active_sessions` | integer |  |  | MinActiveSessions overrides the minimum number of sessions to keep alive. |
@@ -232,6 +234,7 @@ AgentPatch modifies an existing agent identified by (Dir, Name).
 | `depends_on` | []string |  |  | DependsOn overrides the agent's dependency list. |
 | `resume_command` | string |  |  | ResumeCommand overrides the agent's resume_command template. |
 | `wake_mode` | string |  |  | WakeMode overrides the agent's wake mode ("resume" or "fresh"). Enum: `resume`, `fresh` |
+| `mouse_mode` | string |  |  | MouseMode overrides whether tmux mouse mode is preserved ("on" or "off"). Enum: `on`, `off` |
 | `pre_start_append` | []string |  |  | PreStartAppend appends commands to the agent's pre_start list (instead of replacing). Applied after PreStart if both are set. |
 | `session_setup_append` | []string |  |  | SessionSetupAppend appends commands to the agent's session_setup list. |
 | `session_live_append` | []string |  |  | SessionLiveAppend appends commands to the agent's session_live list. |
@@ -304,6 +307,7 @@ DoctorConfig holds settings for the gc doctor surface.
 | `worktree_rig_warn_size` | string |  | `10GB` | WorktreeRigWarnSize is the per-rig warning threshold for the total disk footprint under .gc/worktrees/&lt;rig&gt;/. Reported by the worktree-disk-size check. Go-style human size string ("10GB", "500MB"). Empty or unparseable falls back to the default (10 GB). |
 | `worktree_rig_error_size` | string |  | `50GB` | WorktreeRigErrorSize is the per-rig error threshold. When any rig exceeds this, the worktree-disk-size check reports an error rather than a warning. Empty or unparseable falls back to the default (50 GB). |
 | `nested_worktree_prune` | boolean |  | `false` | NestedWorktreePrune escalates the nested-worktree-prune check from warning to error severity when safely-prunable nested worktrees are present, so CI / scripted doctor runs fail until the operator runs `gc doctor --fix`. Actual removal still requires --fix; this flag does not auto-prune. Safety is enforced by mechanical checks (no uncommitted changes, no unpushed commits, no stashes) — never by role identity. |
+| `check` | []LocalDoctorCheck |  |  | Checks holds city-local inline doctor checks declared via [[doctor.check]] in city.toml. |
 
 ## DoltConfig
 
@@ -369,6 +373,17 @@ K8sConfig holds native K8s session provider settings.
 | `cpu_limit` | string |  | `2` | CPULimit is the pod CPU limit. Default: "2". |
 | `mem_limit` | string |  | `4Gi` | MemLimit is the pod memory limit. Default: "4Gi". |
 | `prebaked` | boolean |  |  | Prebaked skips init container staging and EmptyDir volumes when true. Use with images built by `gc build-image` that have city content baked in. |
+
+## LocalDoctorCheck
+
+LocalDoctorCheck is a city-local doctor check declared inline in city.toml via [[doctor.check]].
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | string | **yes** |  | Name is the bare check name. The SDK injects the "local:" prefix; do not include it here. |
+| `script` | string | **yes** |  | Script is the path to the check script, relative to the city root. Execution registration enforces containment within the city directory. |
+| `description` | string |  |  | Description is optional human-readable text shown in verbose output. |
+| `fix` | string |  |  | Fix is the optional path to a remediation script, relative to the city root. |
 
 ## MailConfig
 
