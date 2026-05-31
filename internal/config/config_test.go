@@ -3021,6 +3021,103 @@ func TestValidateNonNegativeDurationsRejectsNegativeDoltStopTimeout(t *testing.T
 	}
 }
 
+func TestDaemonDoltStartAddressInUseRetryDefault(t *testing.T) {
+	d := DaemonConfig{}
+	got := d.DoltStartAddressInUseRetryWindowDuration()
+	if got != DefaultDoltStartAddressInUseRetryWindow {
+		t.Errorf("DoltStartAddressInUseRetryWindowDuration() = %v, want %v", got, DefaultDoltStartAddressInUseRetryWindow)
+	}
+}
+
+func TestDaemonDoltStartAddressInUseRetryCustom(t *testing.T) {
+	d := DaemonConfig{DoltStartAddressInUseRetryWindow: "45s"}
+	got := d.DoltStartAddressInUseRetryWindowDuration()
+	if got != 45*time.Second {
+		t.Errorf("DoltStartAddressInUseRetryWindowDuration() = %v, want 45s", got)
+	}
+}
+
+func TestDaemonDoltStartAddressInUseRetryZero(t *testing.T) {
+	d := DaemonConfig{DoltStartAddressInUseRetryWindow: "0s"}
+	got := d.DoltStartAddressInUseRetryWindowDuration()
+	if got != 0 {
+		t.Errorf("DoltStartAddressInUseRetryWindowDuration() = %v, want 0", got)
+	}
+}
+
+func TestDaemonDoltStartAddressInUseRetryInvalid(t *testing.T) {
+	d := DaemonConfig{DoltStartAddressInUseRetryWindow: "not-a-duration"}
+	got := d.DoltStartAddressInUseRetryWindowDuration()
+	if got != DefaultDoltStartAddressInUseRetryWindow {
+		t.Errorf("DoltStartAddressInUseRetryWindowDuration() = %v, want %v (default for invalid)", got, DefaultDoltStartAddressInUseRetryWindow)
+	}
+}
+
+// TestDaemonDoltStartAddressInUseRetryWindowNegativePassesThrough mirrors
+// DoltStopTimeoutDuration's policy: negatives are rejected at config load by
+// ValidateNonNegativeDurations, so a negative reaching this helper implies a
+// hand-rolled DaemonConfig that bypassed validation. The helper returns the
+// parsed value as-is so the caller surfaces the misconfiguration rather than
+// silently overriding it. The runtime call site
+// (managedDoltStartWaitForPortFree) treats non-positive windows as "no wait",
+// so a negative effectively disables the retry without corrupting other
+// state.
+func TestDaemonDoltStartAddressInUseRetryWindowNegativePassesThrough(t *testing.T) {
+	d := DaemonConfig{DoltStartAddressInUseRetryWindow: "-1s"}
+	got := d.DoltStartAddressInUseRetryWindowDuration()
+	if got != -1*time.Second {
+		t.Errorf("DoltStartAddressInUseRetryWindowDuration() = %v, want -1s (pass-through, mirrors DoltStopTimeout policy)", got)
+	}
+}
+
+func TestParseDoltStartAddressInUseRetryWindow(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "test"
+
+[daemon]
+dolt_start_address_in_use_retry_window = "45s"
+
+[[agent]]
+name = "mayor"
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Daemon.DoltStartAddressInUseRetryWindow != "45s" {
+		t.Errorf("Daemon.DoltStartAddressInUseRetryWindow = %q, want %q", cfg.Daemon.DoltStartAddressInUseRetryWindow, "45s")
+	}
+	got := cfg.Daemon.DoltStartAddressInUseRetryWindowDuration()
+	if got != 45*time.Second {
+		t.Errorf("DoltStartAddressInUseRetryWindowDuration() = %v, want 45s", got)
+	}
+}
+
+func TestValidateNonNegativeDurationsRejectsNegativeDoltStartAddressInUseRetryWindow(t *testing.T) {
+	cfg := &City{}
+	cfg.Daemon.DoltStartAddressInUseRetryWindow = "-2s"
+	err := ValidateNonNegativeDurations(cfg, "city.toml")
+	if err == nil {
+		t.Fatal("ValidateNonNegativeDurations() = nil, want error for negative dolt_start_address_in_use_retry_window")
+	}
+	if !strings.Contains(err.Error(), "dolt_start_address_in_use_retry_window") ||
+		!strings.Contains(err.Error(), "must not be negative") ||
+		!strings.Contains(err.Error(), `"-2s"`) {
+		t.Errorf("ValidateNonNegativeDurations() error = %q, want it to name the field, the constraint, and the value", err)
+	}
+}
+
+func TestValidateNonNegativeDurationsAllowsZeroAndPositiveDoltStartAddressInUseRetryWindow(t *testing.T) {
+	for _, v := range []string{"", "0s", "30s", "1m"} {
+		cfg := &City{}
+		cfg.Daemon.DoltStartAddressInUseRetryWindow = v
+		if err := ValidateNonNegativeDurations(cfg, "city.toml"); err != nil {
+			t.Errorf("ValidateNonNegativeDurations(dolt_start_address_in_use_retry_window=%q) = %v, want nil", v, err)
+		}
+	}
+}
+
 func TestValidateNonNegativeDurationsAllowsZeroAndPositive(t *testing.T) {
 	for _, v := range []string{"", "0s", "30s", "1m"} {
 		cfg := &City{}
@@ -6075,4 +6172,121 @@ printf 'TRACE=%%s\nARGS=%%s\n' "$GC_WORKFLOW_TRACE" "$*" > %q
 		t.Fatalf("fake gc result missing args:\n%s", data)
 	}
 	return tracePath, args
+}
+
+// TestAllPackDirs covers (*City).AllPackDirs() — the union of PackDirs and
+// RigPackDirs that the prompt renderer relies on. Regression: rig-imported
+// pack template fragments were silently dropped before gascity#2676.
+func TestAllPackDirs(t *testing.T) {
+	cases := []struct {
+		name        string
+		packDirs    []string
+		rigPackDirs map[string][]string
+		want        []string
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:     "city only",
+			packDirs: []string{"/city/packs/a", "/city/packs/b"},
+			want:     []string{"/city/packs/a", "/city/packs/b"},
+		},
+		{
+			name:        "rig only",
+			rigPackDirs: map[string][]string{"alpha": {"/rig/alpha/packs/x"}},
+			want:        []string{"/rig/alpha/packs/x"},
+		},
+		{
+			name:        "both city and rig",
+			packDirs:    []string{"/city/packs/a"},
+			rigPackDirs: map[string][]string{"alpha": {"/rig/alpha/packs/x"}},
+			want:        []string{"/city/packs/a", "/rig/alpha/packs/x"},
+		},
+		{
+			name:     "multiple rigs sorted by rig name",
+			packDirs: []string{"/city/packs/a"},
+			rigPackDirs: map[string][]string{
+				"zulu":  {"/rig/zulu/packs/z"},
+				"alpha": {"/rig/alpha/packs/x"},
+				"mike":  {"/rig/mike/packs/m"},
+			},
+			want: []string{
+				"/city/packs/a",
+				"/rig/alpha/packs/x",
+				"/rig/mike/packs/m",
+				"/rig/zulu/packs/z",
+			},
+		},
+		{
+			name:     "dedup across city and rig keeps first occurrence",
+			packDirs: []string{"/shared/packs/common", "/city/packs/a"},
+			rigPackDirs: map[string][]string{
+				"alpha": {"/shared/packs/common", "/rig/alpha/packs/x"},
+			},
+			want: []string{"/shared/packs/common", "/city/packs/a", "/rig/alpha/packs/x"},
+		},
+		{
+			name: "dedup within a single rig list",
+			rigPackDirs: map[string][]string{
+				"alpha": {"/rig/alpha/packs/x", "/rig/alpha/packs/x", "/rig/alpha/packs/y"},
+			},
+			want: []string{"/rig/alpha/packs/x", "/rig/alpha/packs/y"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &City{PackDirs: tc.packDirs, RigPackDirs: tc.rigPackDirs}
+			got := c.AllPackDirs()
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("AllPackDirs() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAllPackDirs_DeterministicAcrossCalls guards against a Go map-iteration
+// regression: two consecutive calls must return byte-identical ordering even
+// when RigPackDirs has multiple entries.
+func TestAllPackDirs_DeterministicAcrossCalls(t *testing.T) {
+	c := &City{
+		PackDirs: []string{"/city/packs/a"},
+		RigPackDirs: map[string][]string{
+			"zulu":    {"/rig/zulu/packs/z"},
+			"alpha":   {"/rig/alpha/packs/x"},
+			"mike":    {"/rig/mike/packs/m"},
+			"bravo":   {"/rig/bravo/packs/b"},
+			"yankee":  {"/rig/yankee/packs/y"},
+			"charlie": {"/rig/charlie/packs/c"},
+		},
+	}
+	first := c.AllPackDirs()
+	for i := 0; i < 20; i++ {
+		got := c.AllPackDirs()
+		if !reflect.DeepEqual(got, first) {
+			t.Fatalf("AllPackDirs() not deterministic across calls:\n iter %d = %v\n first   = %v", i, got, first)
+		}
+	}
+}
+
+func TestPackDirsForRig(t *testing.T) {
+	c := &City{
+		PackDirs: []string{"/city/packs/a", "/shared/packs/common"},
+		RigPackDirs: map[string][]string{
+			"alpha": {"/shared/packs/common", "/rig/alpha/packs/x"},
+			"bravo": {"/rig/bravo/packs/y"},
+		},
+	}
+
+	got := c.PackDirsForRig("alpha")
+	want := []string{"/city/packs/a", "/shared/packs/common", "/rig/alpha/packs/x"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("PackDirsForRig(alpha) = %v, want %v", got, want)
+	}
+
+	got = c.PackDirsForRig("missing")
+	want = []string{"/city/packs/a", "/shared/packs/common"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("PackDirsForRig(missing) = %v, want %v", got, want)
+	}
 }

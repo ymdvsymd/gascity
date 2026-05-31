@@ -169,7 +169,12 @@ type City struct {
 	// Providers defines named provider presets for agent startup.
 	Providers map[string]ProviderSpec `toml:"providers,omitempty"`
 	// Packs defines named remote pack sources fetched via git (V1 mechanism).
-	Packs map[string]PackSource `toml:"packs,omitempty"`
+	//
+	// Legacy pack source map, accepted for migration and fetch/list
+	// compatibility only. PackV2 authored config uses [imports.*] with source
+	// plus optional version, so this legacy surface is intentionally omitted
+	// from generated public schemas and reference docs.
+	Packs map[string]PackSource `toml:"packs,omitempty" jsonschema:"-"`
 	// Imports defines named pack imports (V2 mechanism). Each key is a
 	// binding name; the value specifies the source and optional version,
 	// export, and transitive controls. Processed during ExpandCityPacks.
@@ -215,6 +220,8 @@ type City struct {
 	// Doctor configures gc doctor thresholds and policy toggles
 	// (worktree size warnings, nested-worktree auto-prune).
 	Doctor DoctorConfig `toml:"doctor,omitempty"`
+	// Maintenance configures periodic store-maintenance loops.
+	Maintenance MaintenanceConfig `toml:"maintenance,omitempty"`
 	// Services declares workspace-owned HTTP services mounted on the
 	// controller edge under /svc/{name}.
 	Services []Service `toml:"service,omitempty"`
@@ -673,8 +680,11 @@ type AgentOverride struct {
 	OptionDefaults map[string]string `toml:"option_defaults,omitempty"`
 }
 
-// PackSource defines a remote pack repository.
-// Referenced by name in rig pack fields and fetched into the cache.
+// PackSource defines a legacy remote pack repository.
+// Referenced by name in V1 pack fields and fetched into the cache.
+//
+// PackSource is retained for legacy migration and fetch/list compatibility.
+// PackV2 authored imports use Import.Source and Import.Version instead.
 type PackSource struct {
 	// Source is the git repository URL.
 	Source string `toml:"source" jsonschema:"required"`
@@ -689,12 +699,14 @@ type PackSource struct {
 // name (the TOML key), a source (local path or remote URL), and
 // optional version/export/transitive controls.
 type Import struct {
-	// Source is the pack location: a local relative path (e.g.,
-	// "./assets/imports/gastown") or a remote URL (e.g.,
-	// "github.com/gastownhall/gastown"). Local paths have no version.
+	// Source is the durable authored pack location: a local path, a remote git
+	// URL, or a remote git URL with a monorepo subpath such as
+	// "github.com/org/repo//packs/foo". Registry handles are lookup-only in
+	// this release wave; authored [imports.*] entries store the resolved source
+	// plus optional version.
 	Source string `toml:"source" jsonschema:"required"`
-	// Version is a semver constraint for remote imports (e.g., "^1.2").
-	// Empty for local paths. "sha:<hex>" for commit pinning.
+	// Version is an optional semver constraint for git-backed imports (e.g.,
+	// "^1.2"). Empty for local paths. "sha:<hex>" pins a specific commit.
 	Version string `toml:"version,omitempty"`
 	// Export re-exports this import's contents into the parent pack's
 	// namespace. Consumers of the parent get this import's agents
@@ -1740,6 +1752,56 @@ func (c ConvergenceConfig) MaxTotalOrDefault() int {
 	return c.MaxTotal
 }
 
+// MaintenanceConfig groups periodic store-maintenance subsections.
+type MaintenanceConfig struct {
+	// Dolt configures the weekly Dolt store maintenance loop
+	// (CALL DOLT_GC + backup snapshot).
+	Dolt DoltMaintenance `toml:"dolt,omitempty"`
+}
+
+// DoltMaintenance configures the periodic Dolt store maintenance loop.
+// Opt-in for v1: omission or enabled=false leaves the loop disabled.
+type DoltMaintenance struct {
+	// Enabled toggles the maintenance loop. Defaults to false (opt-in).
+	Enabled bool `toml:"enabled,omitempty"`
+	// Interval is the cadence between maintenance runs as a duration
+	// string (e.g., "168h"). Defaults to 168h (weekly).
+	Interval string `toml:"interval,omitempty" jsonschema:"default=168h"`
+	// AlertTo is the agent identity to mail on failure (e.g.,
+	// "gascity/mayor"). Empty disables alert mail.
+	AlertTo string `toml:"alert_to,omitempty"`
+	// GCTimeout is the ceiling for CALL DOLT_GC() as a duration string.
+	// Defaults to 10m.
+	GCTimeout string `toml:"gc_timeout,omitempty" jsonschema:"default=10m"`
+}
+
+// IntervalOrDefault returns the parsed Interval, falling back to 168h
+// (weekly) when unset or unparseable. Invalid values should already have
+// surfaced as warnings from ValidateDurations at load time.
+func (d DoltMaintenance) IntervalOrDefault() time.Duration {
+	if d.Interval == "" {
+		return 168 * time.Hour
+	}
+	v, err := time.ParseDuration(d.Interval)
+	if err != nil {
+		return 168 * time.Hour
+	}
+	return v
+}
+
+// GCTimeoutOrDefault returns the parsed GCTimeout, falling back to 10m
+// when unset or unparseable.
+func (d DoltMaintenance) GCTimeoutOrDefault() time.Duration {
+	if d.GCTimeout == "" {
+		return 10 * time.Minute
+	}
+	v, err := time.ParseDuration(d.GCTimeout)
+	if err != nil {
+		return 10 * time.Minute
+	}
+	return v
+}
+
 // DaemonConfig holds controller daemon settings.
 type DaemonConfig struct {
 	// FormulaV2 enables formula v2 graph workflow infrastructure:
@@ -1794,6 +1856,24 @@ type DaemonConfig struct {
 	// that budget can be cut short on that path even though the direct
 	// stop/unregister path always honors the full grace.
 	DoltStopTimeout string `toml:"dolt_stop_timeout,omitempty" jsonschema:"default=30s"`
+	// DoltStartAddressInUseRetryWindow is how long the managed dolt start
+	// path waits on the originally requested port when bind fails with
+	// "address already in use" before falling back to a higher port. The
+	// common cause is a TIME_WAIT socket left by an abrupt stop of a sibling
+	// dolt subprocess (external SIGTERM, supervisor restart, OOM kill); on
+	// Linux the listening-socket slot typically frees within ~30s. Falling
+	// back immediately publishes the rebound port to provider state, after
+	// which `recoverManagedDoltShouldReuseExisting` keeps accepting the
+	// rebound instance as canonical and consumers hardcoded to the original
+	// port stay broken until the orphan is killed. Duration string (e.g.,
+	// "30s", "1m"). Set to "0s" to disable the retry (legacy fall-back-
+	// immediately behavior). Defaults to "30s". Each port is waited on at
+	// most once per startManagedDoltProcessWithOptions invocation, so the
+	// worst-case wall time per startup is bounded by
+	// (DoltStartAddressInUseRetryWindow + per-attempt-startup) × min(5,
+	// distinct-ports-tried) rather than DoltStartAddressInUseRetryWindow × 5.
+	// Negative values are rejected at config load.
+	DoltStartAddressInUseRetryWindow string `toml:"dolt_start_address_in_use_retry_window,omitempty" jsonschema:"default=30s"`
 	// WispGCInterval is how often wisp GC runs. Duration string (e.g., "5m", "1h").
 	// Wisp GC is disabled unless both WispGCInterval and WispTTL are set.
 	WispGCInterval string `toml:"wisp_gc_interval,omitempty"`
@@ -2003,6 +2083,37 @@ func (d *DaemonConfig) DoltStopTimeoutDuration() time.Duration {
 	return dur
 }
 
+// DefaultDoltStartAddressInUseRetryWindow is the per-port retry window used
+// when dolt's bind fails with "address already in use" before the start path
+// falls back to the next available port. 30s is roughly half Linux's default
+// TCP TIME_WAIT — the listening-socket slot typically frees well before the
+// full TIME_WAIT elapses because there are no active half-open connections
+// during a clean restart. Values up to 60s are safer for kernels with
+// tcp_fin_timeout raised; values below 10s materially shrink the window for
+// outliving TIME_WAIT.
+const DefaultDoltStartAddressInUseRetryWindow = 30 * time.Second
+
+// DoltStartAddressInUseRetryWindowDuration returns the configured retry
+// window for the managed-dolt address-in-use loop as a time.Duration.
+// Defaults to DefaultDoltStartAddressInUseRetryWindow (30s) when empty or
+// unparseable. Zero disables the retry — callers fall back to a higher port
+// immediately, matching legacy behavior. Negative values pass through
+// unchanged: callers that route through loadCityConfig already reject them
+// via ValidateNonNegativeDurations, so a negative reaching this helper
+// implies a hand-rolled DaemonConfig that bypassed validation — treat zero
+// as a misconfiguration upstream rather than silently overriding it here.
+// Mirrors DoltStopTimeoutDuration's policy.
+func (d *DaemonConfig) DoltStartAddressInUseRetryWindowDuration() time.Duration {
+	if d.DoltStartAddressInUseRetryWindow == "" {
+		return DefaultDoltStartAddressInUseRetryWindow
+	}
+	dur, err := time.ParseDuration(d.DoltStartAddressInUseRetryWindow)
+	if err != nil {
+		return DefaultDoltStartAddressInUseRetryWindow
+	}
+	return dur
+}
+
 // DefaultProbeConcurrency is the default bd probe concurrency limit.
 // Used by ProbeConcurrencyOrDefault and referenced by cmd/gc/pool.go
 // so the default lives in one place.
@@ -2106,6 +2217,38 @@ func (c *City) FormulasDir() string {
 		return c.Formulas.Dir
 	}
 	return citylayout.FormulasRoot
+}
+
+// AllPackDirs returns the union of city-level and all rig-level pack directories
+// (city dirs first, then sorted-by-rig-name dirs), deduplicated. Use this for
+// global scans that intentionally need the full pack-fragment universe. Prompt
+// rendering for a specific rig should use PackDirsForRig so one rig's fragments
+// cannot override another rig's same-named fragments.
+func (c *City) AllPackDirs() []string {
+	var dirs []string
+	dirs = appendUnique(dirs, c.PackDirs...)
+	rigNames := make([]string, 0, len(c.RigPackDirs))
+	for name := range c.RigPackDirs {
+		rigNames = append(rigNames, name)
+	}
+	sort.Strings(rigNames)
+	for _, name := range rigNames {
+		dirs = appendUnique(dirs, c.RigPackDirs[name]...)
+	}
+	return dirs
+}
+
+// PackDirsForRig returns the city-level pack directories plus the pack
+// directories imported by rigName, deduplicated with city-level dirs kept first.
+// Use this when rendering prompts for one agent so rig-imported template
+// fragments are available without exposing fragments imported by other rigs.
+func (c *City) PackDirsForRig(rigName string) []string {
+	var dirs []string
+	dirs = appendUnique(dirs, c.PackDirs...)
+	if rigName != "" {
+		dirs = appendUnique(dirs, c.RigPackDirs[rigName]...)
+	}
+	return dirs
 }
 
 // AgentDefaults provides city-level agent defaults declared via
