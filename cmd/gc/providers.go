@@ -13,6 +13,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
@@ -23,6 +24,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionacp "github.com/gastownhall/gascity/internal/runtime/acp"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
+	sessioncloudflare "github.com/gastownhall/gascity/internal/runtime/cloudflare"
 	sessionexec "github.com/gastownhall/gascity/internal/runtime/exec"
 	sessionhybrid "github.com/gastownhall/gascity/internal/runtime/hybrid"
 	sessionk8s "github.com/gastownhall/gascity/internal/runtime/k8s"
@@ -148,6 +150,8 @@ func newSessionProviderByName(name string, sc config.SessionConfig, cityName, ci
 		return sessionacp.NewProvider(cfg), nil
 	case "t3bridge":
 		return sessiont3bridge.NewProvider(), nil
+	case "cloudflare":
+		return sessioncloudflare.NewProvider()
 	case "k8s":
 		return sessionk8s.NewProvider()
 	case "hybrid":
@@ -519,14 +523,7 @@ func rawBeadsProviderFromConfig(cityPath string) string {
 }
 
 func providerUsesBdStoreContract(provider string) bool {
-	provider = strings.TrimSpace(provider)
-	if provider == "" || provider == "bd" {
-		return true
-	}
-	if strings.HasPrefix(provider, "exec:") && execProviderBase(provider) == "gc-beads-bd" {
-		return true
-	}
-	return false
+	return contract.ProviderUsesBDContract(provider)
 }
 
 func cityUsesBdStoreContract(cityPath string) bool {

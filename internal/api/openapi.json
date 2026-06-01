@@ -1088,6 +1088,28 @@
         },
         "type": "object"
       },
+      "BeadsDiagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "beads_store": {
+            "type": "string"
+          },
+          "native_store_eligible": {
+            "type": "boolean"
+          },
+          "preflight_gate": {
+            "type": "string"
+          },
+          "preflight_reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "beads_store",
+          "native_store_eligible"
+        ],
+        "type": "object"
+      },
       "BindingStatus": {
         "description": "Lifecycle state of a session binding.",
         "enum": [
@@ -1971,13 +1993,15 @@
             "examples": [
               "https://example.com/errors/example",
               "urn:gascity:error:sling-missing-bead",
-              "urn:gascity:error:sling-cross-rig"
+              "urn:gascity:error:sling-cross-rig",
+              "urn:gascity:error:sling-cross-store-route"
             ],
             "format": "uri",
             "type": "string",
             "x-gascity-problem-types": [
               "urn:gascity:error:sling-missing-bead",
-              "urn:gascity:error:sling-cross-rig"
+              "urn:gascity:error:sling-cross-rig",
+              "urn:gascity:error:sling-cross-store-route"
             ]
           }
         },
@@ -2085,6 +2109,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionMessageSucceededPayload"
+          },
+          {
+            "$ref": "#/components/schemas/SessionResetStalledPayload"
           },
           {
             "$ref": "#/components/schemas/SessionSubmitSucceededPayload"
@@ -4457,6 +4484,12 @@
           "enabled": {
             "type": "boolean"
           },
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "exec": {
             "type": "string"
           },
@@ -6221,6 +6254,31 @@
         ],
         "type": "object"
       },
+      "SessionResetStalledPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "elapsed_s": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "reset_committed_at": {
+            "type": "string"
+          },
+          "session_name": {
+            "type": "string"
+          },
+          "template": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_name",
+          "template",
+          "reset_committed_at",
+          "elapsed_s"
+        ],
+        "type": "object"
+      },
       "SessionRespondInputBody": {
         "additionalProperties": false,
         "properties": {
@@ -6836,6 +6894,10 @@
           "agents": {
             "$ref": "#/components/schemas/StatusAgentCounts",
             "description": "Agent state counts."
+          },
+          "beads": {
+            "$ref": "#/components/schemas/BeadsDiagnostic",
+            "description": "Bead store selection diagnostic. Omitted when unavailable."
           },
           "mail": {
             "$ref": "#/components/schemas/StatusMailCounts",
@@ -7461,6 +7523,7 @@
           "mapping": {
             "bead.closed": "#/components/schemas/TypedEventStreamEnvelopeBeadClosed",
             "bead.created": "#/components/schemas/TypedEventStreamEnvelopeBeadCreated",
+            "bead.deleted": "#/components/schemas/TypedEventStreamEnvelopeBeadDeleted",
             "bead.updated": "#/components/schemas/TypedEventStreamEnvelopeBeadUpdated",
             "city.created": "#/components/schemas/TypedEventStreamEnvelopeCityCreated",
             "city.resumed": "#/components/schemas/TypedEventStreamEnvelopeCityResumed",
@@ -7505,6 +7568,7 @@
             "session.idle_killed": "#/components/schemas/TypedEventStreamEnvelopeSessionIdleKilled",
             "session.max_age_killed": "#/components/schemas/TypedEventStreamEnvelopeSessionMaxAgeKilled",
             "session.quarantined": "#/components/schemas/TypedEventStreamEnvelopeSessionQuarantined",
+            "session.reset_stalled": "#/components/schemas/TypedEventStreamEnvelopeSessionResetStalled",
             "session.stopped": "#/components/schemas/TypedEventStreamEnvelopeSessionStopped",
             "session.stranded": "#/components/schemas/TypedEventStreamEnvelopeSessionStranded",
             "session.suspended": "#/components/schemas/TypedEventStreamEnvelopeSessionSuspended",
@@ -7524,6 +7588,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeBeadCreated"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeBeadDeleted"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeBeadUpdated"
@@ -7658,6 +7725,9 @@
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionQuarantined"
           },
           {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionResetStalled"
+          },
+          {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionStopped"
           },
           {
@@ -7775,6 +7845,48 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope bead.created",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeBeadDeleted": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/BeadEventPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "bead.deleted",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope bead.deleted",
         "type": "object"
       },
       "TypedEventStreamEnvelopeBeadUpdated": {
@@ -8192,9 +8304,11 @@
                 "session.updated",
                 "session.drain_acked_with_assigned_work",
                 "session.stranded",
+                "session.reset_stalled",
                 "session.work_query_failed",
                 "bead.created",
                 "bead.closed",
+                "bead.deleted",
                 "bead.updated",
                 "mail.sent",
                 "mail.read",
@@ -9724,6 +9838,48 @@
         "title": "TypedEventStreamEnvelope session.quarantined",
         "type": "object"
       },
+      "TypedEventStreamEnvelopeSessionResetStalled": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionResetStalledPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.reset_stalled",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope session.reset_stalled",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeSessionStopped": {
         "additionalProperties": false,
         "properties": {
@@ -10150,6 +10306,7 @@
           "mapping": {
             "bead.closed": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadClosed",
             "bead.created": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadCreated",
+            "bead.deleted": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadDeleted",
             "bead.updated": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadUpdated",
             "city.created": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityCreated",
             "city.resumed": "#/components/schemas/TypedTaggedEventStreamEnvelopeCityResumed",
@@ -10194,6 +10351,7 @@
             "session.idle_killed": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionIdleKilled",
             "session.max_age_killed": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled",
             "session.quarantined": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionQuarantined",
+            "session.reset_stalled": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionResetStalled",
             "session.stopped": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStopped",
             "session.stranded": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStranded",
             "session.suspended": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionSuspended",
@@ -10213,6 +10371,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadCreated"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadDeleted"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeBeadUpdated"
@@ -10347,6 +10508,9 @@
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionQuarantined"
           },
           {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionResetStalled"
+          },
+          {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStopped"
           },
           {
@@ -10472,6 +10636,52 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope bead.created",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeBeadDeleted": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/BeadEventPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "bead.deleted",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope bead.deleted",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeBeadUpdated": {
@@ -10928,9 +11138,11 @@
                 "session.updated",
                 "session.drain_acked_with_assigned_work",
                 "session.stranded",
+                "session.reset_stalled",
                 "session.work_query_failed",
                 "bead.created",
                 "bead.closed",
+                "bead.deleted",
                 "bead.updated",
                 "mail.sent",
                 "mail.read",
@@ -12599,6 +12811,52 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope session.quarantined",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSessionResetStalled": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionResetStalledPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.reset_stalled",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope session.reset_stalled",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeSessionStopped": {

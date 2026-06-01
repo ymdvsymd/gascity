@@ -18,6 +18,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
+	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
@@ -226,6 +227,30 @@ func (m *Manager) persistTransport(id, provider, transport string) {
 		return
 	}
 	_ = m.store.SetMetadata(id, "transport", transport)
+}
+
+func (m *Manager) killExistingOrphans(ctx context.Context, sessionID string) {
+	_ = ctx
+	scanner, ok := m.sp.(runtime.ProcessTableScanner)
+	if !ok || sessionID == "" {
+		return
+	}
+	found, err := scanner.FindRuntimesBySessionID(sessionID)
+	if err != nil {
+		log.Printf("session: scanning for orphaned runtimes for %s: %v", sessionID, err)
+	}
+	cityPath := pathutil.NormalizePathForCompare(strings.TrimSpace(m.cityPath))
+	for _, live := range found {
+		if live.IsTracked || live.SessionID != sessionID {
+			continue
+		}
+		if cityPath != "" && pathutil.NormalizePathForCompare(strings.TrimSpace(live.City)) != cityPath {
+			continue
+		}
+		if err := scanner.TerminateRuntime(live); err != nil {
+			log.Printf("session: terminating orphaned runtime for %s pid=%d provider_name=%q: %v", sessionID, live.PID, live.ProviderName, err)
+		}
+	}
 }
 
 func (m *Manager) now() time.Time {
@@ -509,6 +534,7 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 		cfg = runtime.SyncWorkDirEnv(cfg)
 
 		// Start the runtime session.
+		m.killExistingOrphans(ctx, b.ID)
 		if err := m.sp.Start(ctx, sessName, cfg); err != nil {
 			if runtimeSessionMatchesBead(m.sp, sessName, b.ID, meta["instance_token"]) {
 				if metaErr := m.confirmStartedRuntimeMetadata(b.ID, &b); metaErr != nil {
