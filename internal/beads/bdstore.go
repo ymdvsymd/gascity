@@ -453,6 +453,7 @@ type bdIssue struct {
 	IssueType    string       `json:"issue_type"`
 	Priority     *int         `json:"priority,omitempty"`
 	CreatedAt    time.Time    `json:"created_at"`
+	UpdatedAt    time.Time    `json:"updated_at"`
 	Assignee     string       `json:"assignee"`
 	From         string       `json:"from"`
 	ParentID     string       `json:"parent"`
@@ -463,6 +464,7 @@ type bdIssue struct {
 	Metadata     StringMap    `json:"metadata,omitempty"`
 	Dependencies []bdIssueDep `json:"dependencies,omitempty"`
 	Ephemeral    bool         `json:"ephemeral,omitempty"`
+	DeferUntil   *time.Time   `json:"defer_until,omitempty"`
 }
 
 type bdIssueDep struct {
@@ -579,6 +581,7 @@ func (b *bdIssue) toBead() Bead {
 		Type:         b.IssueType,
 		Priority:     cloneIntPtr(b.Priority),
 		CreatedAt:    b.CreatedAt.Truncate(time.Second),
+		UpdatedAt:    b.UpdatedAt.Truncate(time.Second),
 		Assignee:     b.Assignee,
 		From:         from,
 		ParentID:     parentID,
@@ -589,6 +592,7 @@ func (b *bdIssue) toBead() Bead {
 		Metadata:     b.Metadata,
 		Dependencies: deps,
 		Ephemeral:    b.Ephemeral,
+		DeferUntil:   cloneTimePtr(b.DeferUntil),
 	}
 }
 
@@ -656,8 +660,10 @@ func (s *BdStore) Create(b Bead) (Bead, error) {
 		typ = "task"
 	}
 	args := []string{"create", "--json", b.Title, "-t", typ}
+	hasStableID := false
 	if id := strings.TrimSpace(b.ID); id != "" {
 		args = append(args, "--id", id)
+		hasStableID = true
 	}
 	if b.Priority != nil {
 		args = append(args, "--priority", strconv.Itoa(*b.Priority))
@@ -680,6 +686,9 @@ func (s *BdStore) Create(b Bead) (Bead, error) {
 	if b.Ephemeral {
 		args = append(args, "--ephemeral")
 	}
+	if b.DeferUntil != nil {
+		args = append(args, "--defer", b.DeferUntil.Format(time.RFC3339))
+	}
 	metadata := maps.Clone(b.Metadata)
 	if b.From != "" {
 		if metadata == nil {
@@ -696,7 +705,7 @@ func (s *BdStore) Create(b Bead) (Bead, error) {
 		}
 		args = append(args, "--metadata", string(metaJSON))
 	}
-	out, err := s.runner(s.dir, "bd", args...)
+	out, err := s.runBDTransientCreateOutput(hasStableID, args...)
 	if err != nil {
 		return Bead{}, fmt.Errorf("bd create: %w", err)
 	}
@@ -1261,15 +1270,73 @@ func removedLabels(original, current []string) []string {
 }
 
 func (s *BdStore) runBDTransientWrite(args ...string) error {
+	_, err := s.runBDTransientWriteOutput(args...)
+	return err
+}
+
+func (s *BdStore) runBDTransientWriteOutput(args ...string) ([]byte, error) {
+	return s.runBDTransientWriteOutputWhen(isBdTransientWriteError, args...)
+}
+
+func (s *BdStore) runBDTransientCreateOutput(hasStableID bool, args ...string) ([]byte, error) {
+	return s.runBDTransientWriteOutputWhen(func(err error) bool {
+		if !isBdTransientWriteError(err) {
+			return false
+		}
+		return hasStableID || !isBdAmbiguousWriteError(err)
+	}, args...)
+}
+
+func (s *BdStore) runBDTransientWriteOutputWhen(shouldRetry func(error) bool, args ...string) ([]byte, error) {
 	var err error
+	var out []byte
+	args = s.bdTransientWriteArgs(args)
 	for attempt := 1; attempt <= bdTransientWriteAttempts; attempt++ {
-		_, err = s.runner(s.dir, "bd", args...)
-		if err == nil || !isBdTransientWriteError(err) || attempt == bdTransientWriteAttempts {
-			return err
+		out, err = s.runner(s.dir, "bd", args...)
+		if err == nil || !shouldRetry(err) || attempt == bdTransientWriteAttempts {
+			return out, err
 		}
 		time.Sleep(time.Duration(attempt) * 25 * time.Millisecond)
 	}
-	return err
+	return out, err
+}
+
+func (s *BdStore) bdTransientWriteArgs(args []string) []string {
+	if !s.isDoltliteBackend() {
+		return args
+	}
+	out := []string{"--dolt-auto-commit", "off"}
+	out = append(out, args...)
+	return out
+}
+
+func (s *BdStore) isDoltliteBackend() bool {
+	metaPath := filepath.Join(s.dir, ".beads", "metadata.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return false
+	}
+	ok, err := metadataDeclaresDoltlite(data)
+	if err != nil {
+		return false
+	}
+	return ok
+}
+
+func metadataDeclaresDoltlite(data []byte) (bool, error) {
+	var meta struct {
+		Backend  string `json:"backend"`
+		Database string `json:"database"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return false, err
+	}
+	return isDoltliteMetadata(meta.Backend, meta.Database), nil
+}
+
+func isDoltliteMetadata(backend, database string) bool {
+	return strings.EqualFold(strings.TrimSpace(backend), "doltlite") ||
+		strings.EqualFold(strings.TrimSpace(database), "doltlite")
 }
 
 func isBdTransientWriteError(err error) bool {
@@ -1279,7 +1346,16 @@ func isBdTransientWriteError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "Error 1213 (40001): serialization failure") ||
 		strings.Contains(msg, "this transaction conflicts with a committed transaction") ||
-		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "failed to prepare catalog") ||
+		isBdAmbiguousWriteError(err)
+}
+
+func isBdAmbiguousWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "i/o timeout") ||
 		strings.Contains(msg, "invalid connection") ||
 		strings.Contains(msg, "bad connection") ||
 		strings.Contains(msg, "connection reset") ||
@@ -1328,7 +1404,7 @@ func (s *BdStore) CloseAll(ids []string, metadata map[string]string) (int, error
 	// Batch close: bd close [--reason "..."] id1 id2 id3 ...
 	reason := strings.TrimSpace(metadata["close_reason"])
 	args := bdCloseArgs(reason, ids...)
-	_, err := s.runner(s.dir, "bd", args...)
+	err := s.runBDTransientWrite(args...)
 	if err != nil {
 		// Fall back to individual closes on batch failure.
 		closed := 0
@@ -1355,7 +1431,7 @@ func (s *BdStore) CloseAllWithReason(ids []string, reason string) (int, error) {
 		return 0, nil
 	}
 	reason = strings.TrimSpace(reason)
-	_, err := s.runner(s.dir, "bd", bdCloseArgs(reason, ids...)...)
+	err := s.runBDTransientWrite(bdCloseArgs(reason, ids...)...)
 	if err != nil {
 		closed := 0
 		var fallbackErr error
@@ -1414,7 +1490,7 @@ func bdCloseArgs(reason string, ids ...string) []string {
 }
 
 func (s *BdStore) close(id, reason string) error {
-	_, err := s.runner(s.dir, "bd", bdCloseArgs(reason, id)...)
+	err := s.runBDTransientWrite(bdCloseArgs(reason, id)...)
 	if err != nil {
 		// Some bd error paths collapse to a bare exit status without a helpful
 		// not-found string. Re-read the bead to distinguish "already closed" from
@@ -1440,7 +1516,7 @@ func (s *BdStore) close(id, reason string) error {
 
 // Reopen sets a closed bead's status to open via bd reopen.
 func (s *BdStore) Reopen(id string) error {
-	_, err := s.runner(s.dir, "bd", "reopen", "--json", id)
+	err := s.runBDTransientWrite("reopen", "--json", id)
 	if err != nil {
 		if isBdNotFound(err) {
 			return fmt.Errorf("reopening bead %q: %w", id, ErrNotFound)
@@ -1452,7 +1528,7 @@ func (s *BdStore) Reopen(id string) error {
 
 // Delete permanently removes a bead from the store via bd delete.
 func (s *BdStore) Delete(id string) error {
-	_, err := s.runner(s.dir, "bd", "delete", "--force", "--json", id)
+	err := s.runBDTransientWrite("delete", "--force", "--json", id)
 	if err != nil {
 		if isBdNotFound(err) {
 			return fmt.Errorf("deleting bead %q: %w", id, ErrNotFound)
@@ -1595,7 +1671,9 @@ func (s *BdStore) listEphemeral(query ListQuery) ([]Bead, error) {
 }
 
 func canApplyWispsServerLimit(query ListQuery) bool {
-	return query.Sort == SortDefault && query.CreatedBefore.IsZero() && len(query.Metadata) == 0
+	return (query.Sort == SortDefault || query.Sort == SortCreatedDesc) &&
+		query.CreatedBefore.IsZero() &&
+		len(query.Metadata) == 0
 }
 
 func appendBdQueryClause(clauses []string, serverFilteredOnly bool, field, value string) ([]string, bool) {
@@ -1745,36 +1823,31 @@ func (s *BdStore) Children(parentID string, opts ...QueryOpt) ([]Bead, error) {
 	})
 }
 
-// Ready returns open ready beads via bd ready.
+// Ready returns open ready beads via bd ready, including ephemeral rows for
+// wisp-aware tier modes.
 func (s *BdStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 	q := readyQueryFromArgs(query)
-	args := []string{"ready", "--json"}
-	if q.Assignee != "" {
-		args = append(args, "--assignee", q.Assignee)
-	}
-	if q.Limit > 0 {
-		args = append(args, "--limit", strconv.Itoa(q.Limit))
-	} else {
-		args = append(args, "--limit", "0")
-	}
+	includeEphemeral := q.TierMode == TierBoth || q.TierMode == TierWisps
+	args := bdReadyArgs(q, includeEphemeral)
 	out, err := s.runner(s.dir, "bd", args...)
 	if err != nil {
 		return nil, fmt.Errorf("bd ready: %w", err)
 	}
 	issues, parseErr := parseIssuesTolerant(extractJSON(out))
 	result := make([]Bead, 0, len(issues))
+	now := time.Now().UTC()
 	for i := range issues {
 		bead := issues[i].toBead()
-		if IsReadyExcludedType(bead.Type) {
-			continue
-		}
-		if bead.Ephemeral {
+		if !IsReadyCandidateForTier(bead, now, q.TierMode) {
 			continue
 		}
 		if q.Assignee != "" && bead.Assignee != q.Assignee {
 			continue
 		}
 		result = append(result, bead)
+		if q.Limit > 0 && len(result) >= q.Limit {
+			break
+		}
 	}
 	if parseErr != nil {
 		if len(result) == 0 {
@@ -1783,6 +1856,18 @@ func (s *BdStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 		return result, &PartialResultError{Op: "bd ready", Err: parseErr}
 	}
 	return result, nil
+}
+
+func bdReadyArgs(q ReadyQuery, includeEphemeral bool) []string {
+	args := []string{"ready", "--json"}
+	if includeEphemeral {
+		args = append(args, "--include-ephemeral")
+	}
+	if q.Assignee != "" {
+		args = append(args, "--assignee", q.Assignee)
+	}
+	args = append(args, "--limit", "0")
+	return args
 }
 
 // DepAdd records a dependency via bd dep add.
@@ -1802,7 +1887,7 @@ func (s *BdStore) DepAdd(issueID, dependsOnID, depType string) error {
 
 // DepRemove removes a dependency via bd dep remove.
 func (s *BdStore) DepRemove(issueID, dependsOnID string) error {
-	_, err := s.runner(s.dir, "bd", "dep", "remove", issueID, dependsOnID)
+	err := s.runBDTransientWrite("dep", "remove", issueID, dependsOnID)
 	if err != nil {
 		return fmt.Errorf("removing dep %s→%s: %w", issueID, dependsOnID, err)
 	}

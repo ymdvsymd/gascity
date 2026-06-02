@@ -252,7 +252,10 @@ rig directory to find the correct .beads database. This command resolves
 the rig automatically from the --rig flag or by detecting the bead prefix
 in the arguments.
 
-All arguments after "gc bd" are forwarded to bd unchanged.
+All arguments after "gc bd" are forwarded to bd unchanged, except the
+gc-only "heartbeat &lt;issue-id&gt;" subcommand, which rewrites to
+"update &lt;issue-id&gt; --set-metadata gc.last_heartbeat_at=&lt;RFC3339 UTC now&gt;"
+so long-running workers can signal liveness to the dashboard.
 
 gc bd forces BD_EXPORT_AUTO=false to prevent bd's git auto-export hook
 from wedging the wrapper after printing command output. If you need
@@ -269,6 +272,7 @@ gc bd --rig my-project list
   gc bd --rig my-project create "New task"
   gc bd show my-project-abc          # auto-detects rig from bead prefix
   gc bd list --rig my-project -s open
+  gc bd heartbeat my-project-abc     # stamp gc.last_heartbeat_at=now
 ```
 
 ## gc beads
@@ -819,7 +823,7 @@ Manage convoys — graphs of related work beads.
 A convoy is a named graph of beads with dependencies. Convoys
 group related issues via tracks dependencies.
 
-Convoys are distinct from workflows (graph.v2 formula-compiled
+Convoys are distinct from workflows (compiler-v2 formula-compiled
 DAGs managed by the dispatch subsystem) — gc convoy commands do
 not operate on workflow roots.
 
@@ -1634,8 +1638,9 @@ Create a new Gas City workspace in the given directory (or cwd).
 Runs an interactive wizard to choose a config template and coding agent
 provider. Creates the .gc/ runtime directory plus pack.toml, city.toml,
 the standard top-level directories, and .template.md prompt templates, then
-materializes builtin packs under .gc/system/packs. Use --provider to create the default minimal city
-non-interactively, or --file to initialize from an existing TOML config file.
+materializes builtin packs under .gc/system/packs. Use --template and
+--provider to create a city non-interactively, or --file to initialize from an
+existing TOML config file.
 
 Pass --preserve-existing to keep any pre-authored pack.toml, city.toml, or
 agent prompt files in the target directory (useful when bootstrapping a
@@ -1651,6 +1656,7 @@ gc init [path] [flags]
 gc init
   gc init ~/my-city
   gc init --provider codex ~/my-city
+  gc init --template gastown --provider codex ~/my-city
   gc init --provider codex --bootstrap-profile k8s-cell /city
   gc init --name my-city
   gc init --from ~/elan --name elan /city
@@ -1668,6 +1674,7 @@ gc init
 | `--preserve-existing` | bool |  | keep any pre-authored pack.toml, city.toml, or agent prompt files instead of overwriting them |
 | `--provider` | string |  | built-in workspace provider to use for the default mayor config |
 | `--skip-provider-readiness` | bool |  | skip provider login/readiness checks during init and continue startup |
+| `--template` | string |  | config template to use non-interactively (minimal, gastown, custom) |
 | `--yes` | bool |  | bypass the cross-city supervisor cycle confirmation prompt (warning is still printed for the audit trail) |
 
 ## gc lint
@@ -2139,6 +2146,8 @@ Close stale open order-tracking beads.
 
 This is intended for maintenance exec orders. It only closes tracking beads
 older than --stale-after so a fresh in-flight order is not interrupted.
+The manual command runs to completion; controller startup and watchdog sweeps
+use bounded cleanup to avoid spending an unbounded tick on stale work.
 
 Use --include-wisps for operator recovery of abandoned order-run wisp
 subtrees whose open descendants are also older than --stale-after. Pass one
@@ -3367,8 +3376,8 @@ gc sling [target] <bead-or-formula-or-text> [flags]
 | `--on` | string |  | attach wisp from formula to bead before routing |
 | `--owned` | bool |  | mark auto-convoy as owned (skip auto-close) |
 | `--reassign` | bool |  | clear any existing human assignee before routing (for human→pool handoff) |
-| `--scope-kind` | string |  | logical workflow scope kind for graph.v2 launches |
-| `--scope-ref` | string |  | logical workflow scope ref for graph.v2 launches |
+| `--scope-kind` | string |  | logical workflow scope kind for compiler-v2 launches |
+| `--scope-ref` | string |  | logical workflow scope ref for compiler-v2 launches |
 | `--stdin` | bool |  | read bead text from stdin (first line = title, rest = description) |
 | `-t`, `--title` | string |  | wisp root bead title (with --formula or --on) |
 | `--var` | stringArray |  | variable substitution for formula (key=value, repeatable) |

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,9 +22,36 @@ import (
 	"github.com/gastownhall/gascity/internal/dispatch"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
+
+func TestDrainItemRecipeVarsIncludesRuntimeMetadata(t *testing.T) {
+	recipe := &formula.Recipe{
+		Steps: []formula.RecipeStep{{
+			ID:     "item",
+			IsRoot: true,
+			Metadata: map[string]string{
+				"gc.input_convoy_id":              "CONVOY-1",
+				graphv2.RuntimeVarsMetadataKey:    graphv2.RuntimeVarsMetadata(map[string]string{"region": "west", graphv2.ConvoyIDVar: "ignored"}),
+				"gc.unrelated_runtime_vars_noise": "ignored",
+			},
+		}},
+	}
+
+	vars, err := drainItemRecipeVars(recipe)
+	if err != nil {
+		t.Fatalf("drainItemRecipeVars: %v", err)
+	}
+	if vars["convoy_id"] != "CONVOY-1" || vars["region"] != "west" {
+		t.Fatalf("vars = %#v, want convoy_id and inherited region", vars)
+	}
+	if _, ok := vars["issue"]; ok {
+		t.Fatalf("vars = %#v, want reserved issue excluded", vars)
+	}
+}
 
 func TestOpenSourceWorkflowStoresSkipsBrokenRigs(t *testing.T) {
 	// Regression: when a single rig's bead store is unopenable (broken
@@ -412,6 +440,168 @@ func TestWorkflowFormulaSearchPathsUsesRoutedRigLayers(t *testing.T) {
 	})
 	if len(control) != 2 || control[1] != "/rig/frontend/formulas" {
 		t.Fatalf("workflowFormulaSearchPaths(control frontend) = %#v, want rig-specific layers", control)
+	}
+
+	directControl := workflowFormulaSearchPaths(cfg, beads.Bead{
+		Metadata: map[string]string{
+			"gc.routed_to":                  config.ControlDispatcherAgentName,
+			graphExecutionRouteMetaKey:      "session-123",
+			graphExecutionRigContextMetaKey: "frontend",
+		},
+	})
+	if len(directControl) != 2 || directControl[1] != "/rig/frontend/formulas" {
+		t.Fatalf("workflowFormulaSearchPaths(direct control frontend) = %#v, want rig-specific layers", directControl)
+	}
+}
+
+func TestDecorateDrainItemRecipeUsesDirectExecutionRoute(t *testing.T) {
+	store := beads.NewMemStore()
+	direct, err := store.Create(beads.Bead{
+		Title:  "direct session",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "sky",
+			"session_name": "sky-session",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(session): %v", err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test"},
+		Daemon:    config.DaemonConfig{FormulaV2: true},
+	}
+	config.InjectImplicitAgents(cfg)
+	recipe := &formula.Recipe{
+		Name: "item",
+		Steps: []formula.RecipeStep{
+			{
+				ID:     "item",
+				IsRoot: true,
+				Type:   "task",
+				Metadata: map[string]string{
+					"gc.kind":             "workflow",
+					"gc.formula_contract": "graph.v2",
+				},
+			},
+			{
+				ID:    "item.work",
+				Title: "Work",
+				Type:  "task",
+			},
+			{
+				ID:    "item.check",
+				Title: "Check",
+				Type:  "task",
+				Metadata: map[string]string{
+					"gc.kind": "check",
+				},
+			},
+		},
+	}
+	source := beads.Bead{
+		ID: "drain-control",
+		Metadata: map[string]string{
+			graphExecutionRouteMetaKey:      direct.ID,
+			graphExecutionRigContextMetaKey: "frontend",
+		},
+	}
+
+	if err := decorateDrainItemRecipe(recipe, source, store, "city:test", "test", t.TempDir(), cfg); err != nil {
+		t.Fatalf("decorateDrainItemRecipe: %v", err)
+	}
+	work := recipe.StepByID("item.work")
+	if work == nil {
+		t.Fatal("missing item.work")
+	}
+	if work.Assignee != direct.ID {
+		t.Fatalf("item.work assignee = %q, want direct session %s", work.Assignee, direct.ID)
+	}
+	if got := work.Metadata["gc.routed_to"]; got != "" {
+		t.Fatalf("item.work gc.routed_to = %q, want direct session assignment without route metadata", got)
+	}
+	check := recipe.StepByID("item.check")
+	if check == nil {
+		t.Fatal("missing item.check")
+	}
+	if got := check.Metadata[graphExecutionRouteMetaKey]; got != direct.ID {
+		t.Fatalf("item.check execution route = %q, want direct session %s", got, direct.ID)
+	}
+	if got := check.Metadata[graphExecutionRigContextMetaKey]; got != "frontend" {
+		t.Fatalf("item.check execution rig context = %q, want frontend", got)
+	}
+}
+
+func TestDecorateDrainItemRecipeDoesNotFallbackToControllerAssignee(t *testing.T) {
+	store := beads.NewMemStore()
+	maxSessions := 2
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test"},
+		Daemon:    config.DaemonConfig{FormulaV2: true},
+		Agents: []config.Agent{{
+			Name:              "worker",
+			MaxActiveSessions: &maxSessions,
+		}},
+	}
+	config.InjectImplicitAgents(cfg)
+	recipe := &formula.Recipe{
+		Name: "item",
+		Steps: []formula.RecipeStep{
+			{
+				ID:     "item",
+				IsRoot: true,
+				Type:   "task",
+				Metadata: map[string]string{
+					"gc.kind":             "workflow",
+					"gc.formula_contract": "graph.v2",
+				},
+			},
+			{
+				ID:    "item.work",
+				Title: "Work",
+				Type:  "task",
+			},
+			{
+				ID:    "item.explicit",
+				Title: "Explicit route",
+				Type:  "task",
+				Metadata: map[string]string{
+					"gc.run_target": "worker",
+				},
+			},
+		},
+	}
+	source := beads.Bead{
+		ID:       "drain-control",
+		Assignee: config.ControlDispatcherAgentName,
+		Metadata: map[string]string{
+			"gc.kind": "drain",
+		},
+	}
+
+	if err := decorateDrainItemRecipe(recipe, source, store, "city:test", "test", t.TempDir(), cfg); err != nil {
+		t.Fatalf("decorateDrainItemRecipe: %v", err)
+	}
+	work := recipe.StepByID("item.work")
+	if work == nil {
+		t.Fatal("missing item.work")
+	}
+	if work.Assignee != "" {
+		t.Fatalf("item.work assignee = %q, want empty without execution route", work.Assignee)
+	}
+	if got := work.Metadata["gc.routed_to"]; got != "" {
+		t.Fatalf("item.work gc.routed_to = %q, want empty without execution route", got)
+	}
+	explicit := recipe.StepByID("item.explicit")
+	if explicit == nil {
+		t.Fatal("missing item.explicit")
+	}
+	if got := explicit.Metadata["gc.routed_to"]; got != "worker" {
+		t.Fatalf("item.explicit gc.routed_to = %q, want explicit worker route", got)
+	}
+	if explicit.Assignee != "" {
+		t.Fatalf("item.explicit assignee = %q, want pool route without controller fallback", explicit.Assignee)
 	}
 }
 
@@ -1230,6 +1420,85 @@ func TestDecorateDynamicFragmentRecipePreservesPoolFallbackAndScopeMetadata(t *t
 	}
 }
 
+func TestDecorateDynamicFragmentRecipeUsesDirectExecutionRoute(t *testing.T) {
+	store := beads.NewMemStore()
+	direct, err := store.Create(beads.Bead{
+		Title:  "direct session",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "frontend/sky",
+			"session_name": "frontend-sky",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(session): %v", err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Daemon:    config.DaemonConfig{FormulaV2: true},
+	}
+	config.InjectImplicitAgents(cfg)
+	source := beads.Bead{
+		ID:    "gc-source",
+		Title: "Source",
+		Metadata: map[string]string{
+			graphExecutionRouteMetaKey:      direct.ID,
+			graphExecutionRigContextMetaKey: "frontend",
+		},
+	}
+	fragment := &formula.FragmentRecipe{
+		Name: "expansion-review",
+		Steps: []formula.RecipeStep{
+			{
+				ID:    "expansion-review.review",
+				Title: "Review",
+			},
+			{
+				ID:    "expansion-review.check",
+				Title: "Check",
+				Metadata: map[string]string{
+					"gc.kind": "check",
+				},
+			},
+		},
+		Deps: []formula.RecipeDep{
+			{StepID: "expansion-review.check", DependsOnID: "expansion-review.review", Type: "blocks"},
+		},
+	}
+
+	if err := decorateDynamicFragmentRecipe(fragment, source, store, cfg.Workspace.Name, t.TempDir(), cfg); err != nil {
+		t.Fatalf("decorateDynamicFragmentRecipe: %v", err)
+	}
+	steps := map[string]formula.RecipeStep{}
+	for _, step := range fragment.Steps {
+		steps[step.ID] = step
+	}
+	review, ok := steps["expansion-review.review"]
+	if !ok {
+		t.Fatal("missing expansion-review.review")
+	}
+	if review.Assignee != direct.ID {
+		t.Fatalf("review assignee = %q, want direct session %s", review.Assignee, direct.ID)
+	}
+	if got := review.Metadata["gc.routed_to"]; got != "" {
+		t.Fatalf("review gc.routed_to = %q, want direct session assignment without route metadata", got)
+	}
+	check, ok := steps["expansion-review.check"]
+	if !ok {
+		t.Fatal("missing expansion-review.check")
+	}
+	if check.Assignee != config.ControlDispatcherAgentName {
+		t.Fatalf("check assignee = %q, want %q", check.Assignee, config.ControlDispatcherAgentName)
+	}
+	if got := check.Metadata[graphExecutionRouteMetaKey]; got != direct.ID {
+		t.Fatalf("check execution route = %q, want direct session %s", got, direct.ID)
+	}
+	if got := check.Metadata[graphExecutionRigContextMetaKey]; got != "frontend" {
+		t.Fatalf("check execution rig context = %q, want frontend", got)
+	}
+}
+
 func TestDecorateDynamicFragmentRecipeUsesSourceRouteRigContextForBareTargets(t *testing.T) {
 	store := beads.NewMemStore()
 	cfg := &config.City{
@@ -1561,7 +1830,7 @@ func TestRunWorkflowServeReturnsControlErrorWithoutQuarantine(t *testing.T) {
 	}
 }
 
-func TestQuarantineControlGraphBeadClosesWithDiagnostics(t *testing.T) {
+func TestQuarantineControlFailureBeadClosesWithDiagnostics(t *testing.T) {
 	store := beads.NewMemStore()
 	control, err := store.Create(beads.Bead{
 		Title:  "control",
@@ -1575,8 +1844,8 @@ func TestQuarantineControlGraphBeadClosesWithDiagnostics(t *testing.T) {
 		t.Fatalf("create control: %v", err)
 	}
 
-	if err := quarantineControlGraphBead(store, control.ID, fmt.Errorf("bad workflow")); err != nil {
-		t.Fatalf("quarantineControlGraphBead: %v", err)
+	if err := quarantineControlFailureBead(store, control.ID, fmt.Errorf("%w: bad workflow", dispatch.ErrControlGraphMalformed)); err != nil {
+		t.Fatalf("quarantineControlFailureBead: %v", err)
 	}
 
 	got, err := store.Get(control.ID)
@@ -1595,6 +1864,15 @@ func TestQuarantineControlGraphBeadClosesWithDiagnostics(t *testing.T) {
 	if got.Metadata["gc.failure_reason"] != "malformed_control_graph" {
 		t.Fatalf("failure_reason = %q, want malformed_control_graph", got.Metadata["gc.failure_reason"])
 	}
+	if got.Metadata["gc.controller_error_class"] != "hard" {
+		t.Fatalf("controller_error_class = %q, want hard", got.Metadata["gc.controller_error_class"])
+	}
+	if got.Metadata["gc.final_disposition"] != "control_quarantined" {
+		t.Fatalf("final_disposition = %q, want control_quarantined", got.Metadata["gc.final_disposition"])
+	}
+	if !strings.Contains(got.Metadata["gc.controller_error"], "bad workflow") {
+		t.Fatalf("controller_error = %q, want bad workflow", got.Metadata["gc.controller_error"])
+	}
 	if got.Metadata["gc.control_quarantined"] != "true" {
 		t.Fatalf("control_quarantined = %q, want true", got.Metadata["gc.control_quarantined"])
 	}
@@ -1609,7 +1887,7 @@ func TestQuarantineControlGraphBeadClosesWithDiagnostics(t *testing.T) {
 	}
 }
 
-func TestQuarantineControlGraphBeadTruncatesReasonAtUTF8Boundary(t *testing.T) {
+func TestQuarantineControlFailureBeadTruncatesReasonAtUTF8Boundary(t *testing.T) {
 	store := beads.NewMemStore()
 	control, err := store.Create(beads.Bead{
 		Title:  "control",
@@ -1623,8 +1901,8 @@ func TestQuarantineControlGraphBeadTruncatesReasonAtUTF8Boundary(t *testing.T) {
 	}
 	reason := strings.Repeat("a", maxControlQuarantineReasonMetadata-1) + "é tail"
 
-	if err := quarantineControlGraphBead(store, control.ID, errors.New(reason)); err != nil {
-		t.Fatalf("quarantineControlGraphBead: %v", err)
+	if err := quarantineControlFailureBead(store, control.ID, errors.New(reason)); err != nil {
+		t.Fatalf("quarantineControlFailureBead: %v", err)
 	}
 
 	got, err := store.Get(control.ID)
@@ -1637,6 +1915,137 @@ func TestQuarantineControlGraphBeadTruncatesReasonAtUTF8Boundary(t *testing.T) {
 	}
 	if !utf8.ValidString(recorded) {
 		t.Fatalf("recorded reason is invalid UTF-8: %q", recorded)
+	}
+}
+
+func TestRunControlDispatcherReturnsTransientControlErrorWithoutQuarantine(t *testing.T) {
+	clearGCEnv(t)
+
+	base := beads.NewMemStore()
+	missingRootID := "gc-missing-root"
+	control, err := base.Create(beads.Bead{
+		Title: "orphan check",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":           "fanout",
+			"gc.root_bead_id":   missingRootID,
+			"gc.root_store_ref": "city:test",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+	store := transientGetStore{
+		Store:  base,
+		failID: missingRootID,
+		err:    errors.New("bad connection: root lookup timed out"),
+	}
+
+	var stderr bytes.Buffer
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	err = runControlDispatcherWithStoreAndConfig(t.TempDir(), t.TempDir(), store, control, control.ID, cfg, io.Discard, &stderr)
+	if err == nil {
+		t.Fatal("runControlDispatcherWithStoreAndConfig error = nil, want transient error")
+	}
+	if !dispatch.IsTransientControllerError(err) {
+		t.Fatalf("runControlDispatcherWithStoreAndConfig error = %v, want transient classifier match", err)
+	}
+
+	after, err := base.Get(control.ID)
+	if err != nil {
+		t.Fatalf("get control: %v", err)
+	}
+	if after.Status != "open" {
+		t.Fatalf("control status = %q, want open", after.Status)
+	}
+	if got := after.Metadata["gc.control_quarantined"]; got != "" {
+		t.Fatalf("gc.control_quarantined = %q, want empty", got)
+	}
+	if got := after.Metadata["gc.final_disposition"]; got != "" {
+		t.Fatalf("gc.final_disposition = %q, want empty", got)
+	}
+	if slices.Contains(after.Labels, "gc:control-quarantined") {
+		t.Fatalf("labels = %#v, want no gc:control-quarantined", after.Labels)
+	}
+}
+
+type transientGetStore struct {
+	beads.Store
+	failID string
+	err    error
+}
+
+func (s transientGetStore) Get(id string) (beads.Bead, error) {
+	if id == s.failID {
+		return beads.Bead{}, s.err
+	}
+	return s.Store.Get(id)
+}
+
+func TestRunControlDispatcherQuarantineReconcilesScopedControlFailure(t *testing.T) {
+	clearGCEnv(t)
+
+	store := beads.NewMemStore()
+	workflow, err := store.Create(beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+	body, err := store.Create(beads.Bead{
+		Title: "scope body",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "scope",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "review-loop.iteration.1",
+			"gc.scope_role":   "body",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create scope body: %v", err)
+	}
+	control, err := store.Create(beads.Bead{
+		Title: "unsupported scoped control",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "unknown-control-kind",
+			"gc.root_bead_id": workflow.ID,
+			"gc.scope_ref":    "review-loop.iteration.1",
+			"gc.scope_role":   "member",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	if err := runControlDispatcherWithStoreAndConfig(t.TempDir(), t.TempDir(), store, control, control.ID, cfg, io.Discard, &stderr); err != nil {
+		t.Fatalf("runControlDispatcherWithStoreAndConfig: %v", err)
+	}
+
+	afterControl, err := store.Get(control.ID)
+	if err != nil {
+		t.Fatalf("get control: %v", err)
+	}
+	if afterControl.Status != "closed" {
+		t.Fatalf("control status = %q, want closed", afterControl.Status)
+	}
+	afterBody, err := store.Get(body.ID)
+	if err != nil {
+		t.Fatalf("get scope body: %v", err)
+	}
+	if afterBody.Status != "closed" {
+		t.Fatalf("scope body status = %q, want closed", afterBody.Status)
+	}
+	if got := afterBody.Metadata["gc.outcome"]; got != "fail" {
+		t.Fatalf("scope body gc.outcome = %q, want fail", got)
 	}
 }
 
@@ -3597,6 +4006,57 @@ func TestRunControlDispatcherQuarantinesMalformedFanoutScopeBody(t *testing.T) {
 	}
 }
 
+func TestRunControlDispatcherQuarantinesGenericControlFailure(t *testing.T) {
+	clearGCEnv(t)
+
+	store := beads.NewMemStore()
+	control, err := store.Create(beads.Bead{
+		Title: "Unsupported control",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind": "unknown-control-kind",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	if err := runControlDispatcherWithStoreAndConfig(t.TempDir(), t.TempDir(), store, control, control.ID, cfg, io.Discard, &stderr); err != nil {
+		t.Fatalf("runControlDispatcherWithStoreAndConfig: %v", err)
+	}
+
+	after, err := store.Get(control.ID)
+	if err != nil {
+		t.Fatalf("get control: %v", err)
+	}
+	if after.Status != "closed" {
+		t.Fatalf("control status = %q, want closed", after.Status)
+	}
+	if got := after.Metadata["gc.outcome"]; got != "fail" {
+		t.Fatalf("gc.outcome = %q, want fail", got)
+	}
+	if got := after.Metadata["gc.failure_reason"]; got != "control_dispatch_error" {
+		t.Fatalf("gc.failure_reason = %q, want control_dispatch_error", got)
+	}
+	if got := after.Metadata["gc.control_quarantined"]; got != "true" {
+		t.Fatalf("gc.control_quarantined = %q, want true", got)
+	}
+	if got := after.Metadata["gc.controller_error"]; !strings.Contains(got, "unsupported control bead kind") {
+		t.Fatalf("gc.controller_error = %q, want unsupported control bead kind", got)
+	}
+	if got := after.Metadata["gc.final_disposition"]; got != "control_quarantined" {
+		t.Fatalf("gc.final_disposition = %q, want control_quarantined", got)
+	}
+	if !slices.Contains(after.Labels, "gc:control-quarantined") {
+		t.Fatalf("labels = %#v, want gc:control-quarantined", after.Labels)
+	}
+	if got := stderr.String(); !strings.Contains(got, "control dispatch: quarantined bead="+control.ID) {
+		t.Fatalf("stderr = %q, want quarantine message", got)
+	}
+}
+
 func TestRunWorkflowServeSkipsLegacyOversizedControlAndProcessesLaterReady(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
@@ -3952,6 +4412,54 @@ func TestRunWorkflowServeFollowResetsBackoffForProcessedEventAndPending(t *testi
 	}
 	if !slices.Equal(waitCalls, want) {
 		t.Fatalf("wait calls = %#v, want %#v", waitCalls, want)
+	}
+}
+
+// TestRunWorkflowServeFollowSurvivesTransientWorkQueryTimeout is the
+// regression guard for the bug where a single transient work-query timeout
+// (the bead store briefly saturated) killed the entire control-dispatcher
+// --follow loop, leaving the rig un-dispatched while its session bead still
+// reported "active". The loop must survive transient failures and only exit on
+// genuinely fatal ones.
+func TestRunWorkflowServeFollowSurvivesTransientWorkQueryTimeout(t *testing.T) {
+	eventsDir := t.TempDir()
+	ep := newTestProvider(t, eventsDir)
+
+	prevList := workflowServeList
+	prevProvider := workflowServeOpenEventsProvider
+	prevWait := workflowServeWaitForWake
+	t.Cleanup(func() {
+		workflowServeList = prevList
+		workflowServeOpenEventsProvider = prevProvider
+		workflowServeWaitForWake = prevWait
+	})
+
+	workflowServeOpenEventsProvider = func(io.Writer) (events.Provider, error) { return ep, nil }
+	workflowServeWaitForWake = func(_ <-chan workflowWatchResult, _ time.Duration, _ int) (bool, error) {
+		return false, nil
+	}
+
+	// Drain 1 hits a transient work-query timeout (wraps DeadlineExceeded) — the
+	// loop must survive it. Drain 2 returns a genuinely fatal error — the loop
+	// must exit on that.
+	transientErr := fmt.Errorf("querying control work: running work query %q: timed out after 30s: %w", "bd ready", context.DeadlineExceeded)
+	fatalErr := errors.New("malformed work query: jq: command not found")
+	calls := 0
+	workflowServeList = func(_, _ string, _ map[string]string) ([]hookBead, error) {
+		calls++
+		if calls == 1 {
+			return nil, transientErr
+		}
+		return nil, fatalErr
+	}
+
+	agent := config.Agent{Name: "control-dispatcher"}
+	err := runWorkflowServeFollow(agent, t.TempDir(), t.TempDir(), agent.EffectiveWorkQuery(), nil, io.Discard)
+	if !errors.Is(err, fatalErr) {
+		t.Fatalf("runWorkflowServeFollow err = %v, want fatal error after surviving the transient timeout", err)
+	}
+	if calls != 2 {
+		t.Fatalf("workflowServeList calls = %d, want 2 (survive transient, then exit on fatal)", calls)
 	}
 }
 
