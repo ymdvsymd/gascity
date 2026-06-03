@@ -705,6 +705,7 @@ gc converge
 | [gc converge status](#gc-converge-status) | Show convergence loop status |
 | [gc converge stop](#gc-converge-stop) | Stop a convergence loop |
 | [gc converge test-gate](#gc-converge-test-gate) | Dry-run the gate condition (no state changes) |
+| [gc converge test-trigger](#gc-converge-test-trigger) | Dry-run the trigger condition (no state changes) |
 
 ## gc converge approve
 
@@ -738,6 +739,8 @@ gc converge create [flags]
 | `--max-iterations` | int | `5` | Maximum iterations |
 | `--target` | string |  | Target agent (required) |
 | `--title` | string |  | Convergence loop title |
+| `--trigger` | string |  | Iteration trigger mode: event (gate each iteration on --trigger-condition). Empty disables. |
+| `--trigger-condition` | string |  | Path to trigger condition script (required when --trigger=event) |
 | `--var` | stringArray |  | Template variable (key=value, repeatable) |
 
 ## gc converge iterate
@@ -810,6 +813,18 @@ Dry-run the gate condition (no state changes)
 
 ```
 gc converge test-gate <bead-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | Output JSONL summary |
+
+## gc converge test-trigger
+
+Dry-run the trigger condition (no state changes)
+
+```
+gc converge test-trigger <bead-id> [flags]
 ```
 
 | Flag | Type | Default | Description |
@@ -1306,6 +1321,7 @@ gc formula
 | [gc formula cook](#gc-formula-cook) | Instantiate a formula into the current bead store |
 | [gc formula list](#gc-formula-list) | List available formulas |
 | [gc formula show](#gc-formula-show) | Show a compiled formula recipe |
+| [gc formula version-check](#gc-formula-version-check) | Check if a bead's formula matches the current on-disk version |
 
 ## gc formula cook
 
@@ -1370,6 +1386,27 @@ gc formula show <formula-name> [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSON |
 | `--var` | stringArray |  | variable substitution for preview (key=value) |
+
+## gc formula version-check
+
+Compare the formula content hash stored on a molecule/workflow bead
+against the current on-disk formula file. Exits 0 if they match, 1 if
+they diverge.
+
+The bead must have gc.formula_hash metadata (set during instantiation).
+The formula is located via the bead's Ref field and the current formula
+search paths.
+
+Use this to detect whether a running session's formula has been updated
+since it was spawned.
+
+```
+gc formula version-check <bead-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | output result as JSON |
 
 ## gc github
 
@@ -1729,8 +1766,9 @@ Use this to dismiss messages without reading them. Each message is removed
 and will no longer appear in mail check or inbox results. When multiple IDs
 are passed, they are archived in input order.
 
-For large advisory backlogs, use --to with --subject-prefix, --subject-contains,
-or --from to archive a bounded matching slice without enumerating IDs by hand.
+For large advisory backlogs, use --to or --all-recipients with
+--subject-prefix, --subject-contains, or --from to archive a bounded matching
+slice without enumerating IDs by hand.
 
 ```
 gc mail archive <id>... [flags]
@@ -1738,7 +1776,9 @@ gc mail archive <id>... [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--all-recipients` | bool |  | archive matching messages across all recipients |
 | `--dry-run` | bool |  | list matching messages without archiving them |
+| `--empty-body` | bool |  | only archive matching messages whose body is empty |
 | `--from` | string |  | archive matching unread messages from this exact sender |
 | `--include-read` | bool |  | include read-but-open messages when selecting by filter |
 | `--json` | bool |  | emit JSONL result |
@@ -1885,7 +1925,7 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | reply body text |
-| `--notify` | bool |  | nudge the recipient after replying |
+| `--notify` | bool |  | nudge the recipient about this reply, even if earlier mail is still unread |
 | `-s`, `--subject` | string |  | reply subject line |
 
 ## gc mail send
@@ -1921,7 +1961,7 @@ gc mail send mayor "Build is green"
 | `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
-| `--notify` | bool |  | nudge the recipient after sending |
+| `--notify` | bool |  | nudge the recipient about this message, even if earlier mail is still unread |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
 

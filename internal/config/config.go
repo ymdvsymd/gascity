@@ -1181,6 +1181,78 @@ type BeadsConfig struct {
 	// Backend selects the bd storage engine when Provider is "bd".
 	// Empty defaults to "dolt"; T3Code uses "doltlite" for local dev stores.
 	Backend string `toml:"backend,omitempty"`
+	// EventHooks controls installation of the bead event-forwarding hooks
+	// (.beads/hooks/on_create,on_update,on_close). Defaults to true.
+	// This config surface is staged ahead of the native bead-event support;
+	// current hook behavior remains unchanged until lifecycle code opts in.
+	EventHooks *bool `toml:"event_hooks,omitempty" jsonschema:"default=true"`
+	// Policies defines per-bead-use storage and garbage-collection defaults.
+	// Policy names are interpreted by higher-level systems; unknown names are
+	// preserved so packs can stage future policy classes without breaking load.
+	Policies map[string]BeadPolicyConfig `toml:"policies,omitempty"`
+}
+
+// EventHooksEnabled reports whether bead event hooks should be installed.
+// Unset preserves the current default of enabled hooks.
+func (b BeadsConfig) EventHooksEnabled() bool {
+	return b.EventHooks == nil || *b.EventHooks
+}
+
+// BeadPolicyConfig holds storage and retention defaults for a named bead use.
+type BeadPolicyConfig struct {
+	// Storage selects the intended persistence tier: "history", "no_history",
+	// or "ephemeral". Creation paths apply this incrementally as they opt in.
+	Storage string `toml:"storage,omitempty" jsonschema:"enum=history,enum=no_history,enum=ephemeral"`
+	// DeleteAfterClose deletes matching GC-owned beads after they have been
+	// closed for this duration. Accepts Go duration syntax plus whole-day "d"
+	// units, e.g. "7d" or "1d12h". Empty means the policy is not GC-managed.
+	DeleteAfterClose string `toml:"delete_after_close,omitempty"`
+}
+
+const (
+	// BeadStorageHistory stores beads in the normal history-tracked table.
+	BeadStorageHistory = "history"
+	// BeadStorageNoHistory stores beads without Dolt history while keeping
+	// non-ephemeral semantics.
+	BeadStorageNoHistory = "no_history"
+	// BeadStorageEphemeral stores beads as ephemeral wisps.
+	BeadStorageEphemeral = "ephemeral"
+)
+
+// NormalizeBeadPolicyStorage returns the configured bead policy storage value.
+// Storage spellings are intentionally canonical so runtime validation matches
+// the generated schema enum.
+func NormalizeBeadPolicyStorage(storage string) string {
+	return storage
+}
+
+// ValidBeadPolicyStorage reports whether storage is one of the supported bead
+// storage classes. Empty storage is valid and means use the default.
+func ValidBeadPolicyStorage(storage string) bool {
+	switch NormalizeBeadPolicyStorage(storage) {
+	case "", BeadStorageHistory, BeadStorageNoHistory, BeadStorageEphemeral:
+		return true
+	default:
+		return false
+	}
+}
+
+// NormalizedStorage returns the canonical storage class for this policy.
+func (p BeadPolicyConfig) NormalizedStorage() string {
+	return NormalizeBeadPolicyStorage(p.Storage)
+}
+
+// DeleteAfterCloseDuration returns DeleteAfterClose as a duration. It accepts
+// ordinary Go durations plus a whole-day "d" unit, e.g. "7d" and "1d12h".
+func (p BeadPolicyConfig) DeleteAfterCloseDuration() time.Duration {
+	if p.DeleteAfterClose == "" {
+		return 0
+	}
+	dur, err := parseConfigDurationWithDays(p.DeleteAfterClose)
+	if err != nil || dur <= 0 {
+		return 0
+	}
+	return dur
 }
 
 // SessionConfig holds session provider settings.
@@ -2247,6 +2319,68 @@ func (d *DaemonConfig) WispGCEnabled() bool {
 	return d.WispGCIntervalDuration() > 0 && d.WispTTLDuration() > 0
 }
 
+// parseConfigDurationWithDays extends time.ParseDuration with a whole-day "d"
+// unit. It accepts ordinary Go durations unchanged and supports one leading day
+// component such as "7d" or "1d12h".
+func parseConfigDurationWithDays(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	dayIdx := strings.IndexByte(raw, 'd')
+	if dayIdx < 0 {
+		return time.ParseDuration(raw)
+	}
+	days, err := parsePositiveDurationDays(raw[:dayIdx])
+	if err != nil {
+		return 0, err
+	}
+	dayDuration := time.Duration(days) * 24 * time.Hour
+	rest := raw[dayIdx+1:]
+	if rest == "" {
+		return dayDuration, nil
+	}
+	dur, err := time.ParseDuration(rest)
+	if err != nil {
+		return 0, err
+	}
+	return addConfigDurations(dayDuration, dur)
+}
+
+func parsePositiveDurationDays(raw string) (int64, error) {
+	if raw == "" {
+		return 0, fmt.Errorf("missing day count")
+	}
+	for _, r := range raw {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("invalid day count %q", raw)
+		}
+	}
+	days, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if days <= 0 {
+		return 0, fmt.Errorf("day count must be positive")
+	}
+	if days > maxConfigDurationDays {
+		return 0, fmt.Errorf("day count %q exceeds maximum %d", raw, maxConfigDurationDays)
+	}
+	return days, nil
+}
+
+const maxConfigDurationDays = int64(1<<63-1) / int64(24*time.Hour)
+
+func addConfigDurations(a, b time.Duration) (time.Duration, error) {
+	if b > 0 && a > time.Duration(1<<63-1)-b {
+		return 0, fmt.Errorf("duration exceeds maximum")
+	}
+	if b < 0 && a < time.Duration(-1<<63)-b {
+		return 0, fmt.Errorf("duration is below minimum")
+	}
+	return a + b, nil
+}
+
 // FormulasDir returns the formulas directory, defaulting to "formulas".
 func (c *City) FormulasDir() string {
 	if c.Formulas.Dir != "" {
@@ -2917,12 +3051,12 @@ func (a *Agent) poolDemandTarget() string {
 func standardAssignedWorkQueryScript() string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd list --include-ephemeral --status in_progress --assignee="$id" --exclude-type=epic --json --limit=1 2>/dev/null); ` +
+		`r=$(bd list --include-ephemeral --status in_progress --assignee="$id" --json --limit=1 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`done; ` +
 		`for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd ready --include-ephemeral --assignee="$id" --exclude-type=epic --json --limit=1 2>/dev/null); ` +
+		`r=$(bd ready --include-ephemeral --assignee="$id" --json --limit=1 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`done; `
 }
@@ -2933,7 +3067,7 @@ func legacyControlAssignedWorkQueryScript() string {
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd list --include-ephemeral --status in_progress --assignee="$cand" --exclude-type=epic --json --limit=1 2>/dev/null); ` +
+		`r=$(bd list --include-ephemeral --status in_progress --assignee="$cand" --json --limit=1 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`done; ` +
 		`done; ` +
@@ -2942,7 +3076,7 @@ func legacyControlAssignedWorkQueryScript() string {
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd ready --include-ephemeral --assignee="$cand" --exclude-type=epic --json --limit=1 2>/dev/null); ` +
+		`r=$(bd ready --include-ephemeral --assignee="$cand" --json --limit=1 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`done; ` +
 		`done; `
@@ -2966,15 +3100,22 @@ func poolDemandOriginGateScript() string {
 //
 // State priority: in_progress+assigned (crash recovery) >
 // ready+assigned (pre-assigned) > ready+unassigned+routed_to (pool).
-// Formula roots that are themselves executable must be represented as ready()
-// work (for example type=wisp); molecule containers are not routable demand.
+// Executable formula roots are ephemeral epics (mol wisp preserves the
+// template-epic IssueType and marks Ephemeral=true); molecule containers
+// are not routable demand.
 //
-// Parent epics are excluded from every tier (--exclude-type=epic). An epic
-// has no executable spec — its semantic is "all children done" — so a worker
-// claiming an epic does undefined work (gc-udx). Roles that legitimately
-// process epics (oversight, reviewers, closers) opt in by setting an explicit
-// work_query in their agent config; that custom query is returned unchanged
-// above.
+// Parent epics are excluded from the routed (pool) tier only
+// (--exclude-type=epic). An unassigned parent epic has no executable spec —
+// its semantic is "all children done" — so a pool worker claiming one does
+// undefined work (gc-udx; the repro is a routed parent epic, see
+// TestEffectiveWorkQuerySkipsEpicLeafScenario). The assigned tiers do NOT
+// exclude epics: work already assigned to this agent is owned, and the
+// patrol-loop pattern (gastown witness/refinery/deacon) self-assigns an
+// ephemeral epic wisp that the agent must resume after a session restart.
+// Excluding epics there silently stranded those wisps (gc hook exited 1 with
+// empty output). Roles that need different behavior still opt in via an
+// explicit work_query in their agent config; that custom query is returned
+// unchanged above.
 //
 // When the reconciler runs the query for demand detection (no session
 // context), all identity vars are empty → assignee tiers skip → only

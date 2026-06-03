@@ -543,6 +543,8 @@ name = "test-city"
 
 [beads]
 provider = "file"
+backend = "doltlite"
+event_hooks = false
 
 [[agent]]
 name = "mayor"
@@ -553,6 +555,12 @@ name = "mayor"
 	}
 	if cfg.Beads.Provider != "file" {
 		t.Errorf("Beads.Provider = %q, want %q", cfg.Beads.Provider, "file")
+	}
+	if cfg.Beads.Backend != "doltlite" {
+		t.Errorf("Beads.Backend = %q, want %q", cfg.Beads.Backend, "doltlite")
+	}
+	if cfg.Beads.EventHooks == nil || *cfg.Beads.EventHooks {
+		t.Errorf("Beads.EventHooks = %v, want false", cfg.Beads.EventHooks)
 	}
 }
 
@@ -571,6 +579,12 @@ name = "mayor"
 	if cfg.Beads.Provider != "" {
 		t.Errorf("Beads.Provider = %q, want empty", cfg.Beads.Provider)
 	}
+	if cfg.Beads.EventHooks != nil {
+		t.Errorf("Beads.EventHooks = %v, want nil", cfg.Beads.EventHooks)
+	}
+	if cfg.Beads.Policies != nil {
+		t.Errorf("Beads.Policies = %v, want nil", cfg.Beads.Policies)
+	}
 }
 
 func TestMarshalOmitsEmptyBeadsSection(t *testing.T) {
@@ -581,6 +595,83 @@ func TestMarshalOmitsEmptyBeadsSection(t *testing.T) {
 	}
 	if strings.Contains(string(data), "[beads]") {
 		t.Errorf("Marshal output should not contain '[beads]' when empty:\n%s", data)
+	}
+}
+
+func TestParseBeadsPoliciesSection(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "test-city"
+
+[beads]
+event_hooks = false
+
+[beads.policies.control]
+storage = "no_history"
+delete_after_close = "1d12h"
+
+[beads.policies.workflow]
+storage = "ephemeral"
+
+[[agent]]
+name = "mayor"
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Beads.EventHooks == nil || *cfg.Beads.EventHooks {
+		t.Fatalf("Beads.EventHooks = %v, want false", cfg.Beads.EventHooks)
+	}
+	if len(cfg.Beads.Policies) != 2 {
+		t.Fatalf("len(Beads.Policies) = %d, want 2", len(cfg.Beads.Policies))
+	}
+	control := cfg.Beads.Policies["control"]
+	if got := control.NormalizedStorage(); got != BeadStorageNoHistory {
+		t.Errorf("control.NormalizedStorage() = %q, want %q", got, BeadStorageNoHistory)
+	}
+	if got := control.DeleteAfterCloseDuration(); got != 36*time.Hour {
+		t.Errorf("control.DeleteAfterCloseDuration() = %v, want 36h", got)
+	}
+	workflow := cfg.Beads.Policies["workflow"]
+	if got := workflow.NormalizedStorage(); got != BeadStorageEphemeral {
+		t.Errorf("workflow.NormalizedStorage() = %q, want %q", got, BeadStorageEphemeral)
+	}
+}
+
+func TestBeadsConfigRoundTripPreservesStagedFields(t *testing.T) {
+	disabled := false
+	c := City{
+		Workspace: Workspace{Name: "test"},
+		Beads: BeadsConfig{
+			Provider:   "bd",
+			Backend:    "doltlite",
+			EventHooks: &disabled,
+			Policies: map[string]BeadPolicyConfig{
+				"control": {
+					Storage:          BeadStorageNoHistory,
+					DeleteAfterClose: "48h",
+				},
+			},
+		},
+		Agents: []Agent{{Name: "mayor"}},
+	}
+	data, err := c.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	got, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse(Marshal output): %v\n%s", err, data)
+	}
+	if got.Beads.EventHooks == nil || *got.Beads.EventHooks {
+		t.Errorf("round-tripped EventHooks = %v, want false", got.Beads.EventHooks)
+	}
+	if got.Beads.Backend != "doltlite" {
+		t.Errorf("round-tripped Backend = %q, want doltlite", got.Beads.Backend)
+	}
+	if got.Beads.Policies["control"].DeleteAfterClose != "48h" {
+		t.Errorf("round-tripped policy = %#v, want delete_after_close=48h", got.Beads.Policies["control"])
 	}
 }
 
@@ -1697,14 +1788,14 @@ func TestEffectiveWorkQueryControlDispatcherClaimsLegacyAssignedWork(t *testing.
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "list --include-ephemeral --status in_progress --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=1"|\
-  "list --include-ephemeral --status in_progress --assignee=gascity/control-dispatcher --exclude-type=epic --json --limit=1"|\
-  "list --include-ephemeral --status in_progress --assignee=gascity--workflow-control --exclude-type=epic --json --limit=1"|\
-  "list --include-ephemeral --status in_progress --assignee=gascity/workflow-control --exclude-type=epic --json --limit=1")
+  "list --include-ephemeral --status in_progress --assignee=gascity--control-dispatcher --json --limit=1"|\
+  "list --include-ephemeral --status in_progress --assignee=gascity/control-dispatcher --json --limit=1"|\
+  "list --include-ephemeral --status in_progress --assignee=gascity--workflow-control --json --limit=1"|\
+  "list --include-ephemeral --status in_progress --assignee=gascity/workflow-control --json --limit=1")
     printf '[]'
     ;;
-  "ready --include-ephemeral --assignee=gascity--workflow-control --exclude-type=epic --json --limit=1"|\
-  "ready --include-ephemeral --assignee=gascity/workflow-control --exclude-type=epic --json --limit=1")
+  "ready --include-ephemeral --assignee=gascity--workflow-control --json --limit=1"|\
+  "ready --include-ephemeral --assignee=gascity/workflow-control --json --limit=1")
     printf '[{"id":"ga-legacy-ready"}]'
     ;;
   *)
@@ -1842,37 +1933,85 @@ func TestEffectiveSlingQueryPoolNameOverride(t *testing.T) {
 func TestEffectiveWorkQueryExcludesEpics(t *testing.T) {
 	a := Agent{Name: "worker", Dir: "hello-world"}
 	got := a.EffectiveWorkQuery()
-	// All three tiers (in_progress assignee, ready assignee, ready routed)
-	// must structurally exclude the epic type.
-	wantSnippets := []string{
-		`bd list --include-ephemeral --status in_progress --assignee="$id" --exclude-type=epic --json`,
-		`bd ready --include-ephemeral --assignee="$id" --exclude-type=epic --json`,
+	// The routed (pool) tier excludes parent epics (gc-udx): an unassigned
+	// routed epic has no executable spec, so a pool worker grabbing one does
+	// undefined work. The assigned tiers do NOT exclude epics — an agent must
+	// resume its own assigned ephemeral epic wisp (the patrol-loop pattern).
+	wantPresent := []string{
+		// routed/pool tier still excludes epics (gc-udx guard)
 		`bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json`,
+		// assigned tiers carry NO epic exclusion
+		`bd list --include-ephemeral --status in_progress --assignee="$id" --json`,
+		`bd ready --include-ephemeral --assignee="$id" --json`,
 		`-- hello-world/worker`,
 	}
-	for _, want := range wantSnippets {
+	for _, want := range wantPresent {
 		if !strings.Contains(got, want) {
-			t.Errorf("EffectiveWorkQuery() missing exclude-type=epic on tier:\n  want substring: %s\n  got: %s", want, got)
+			t.Errorf("EffectiveWorkQuery() missing expected substring:\n  want: %s\n  got: %s", want, got)
 		}
+	}
+	// The assigned tiers must NOT carry --exclude-type=epic, or self-assigned
+	// epic wisps get stranded (gc hook exits 1 with empty output).
+	if bad := `--assignee="$id" --exclude-type=epic`; strings.Contains(got, bad) {
+		t.Errorf("EffectiveWorkQuery() assigned tier must not exclude epics, found: %s\n  got: %s", bad, got)
 	}
 }
 
 // TestEffectiveWorkQueryExcludesEpicsControlDispatcher verifies the
 // control-dispatcher path (which has an extra legacy workflow-control
-// route) also excludes epics on every tier.
+// route) excludes epics on the routed (pool) tier but not the assigned
+// tiers — same scoping as the standard path.
 func TestEffectiveWorkQueryExcludesEpicsControlDispatcher(t *testing.T) {
 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
 	got := a.EffectiveWorkQuery()
-	wantSnippets := []string{
-		`bd list --include-ephemeral --status in_progress --assignee="$cand" --exclude-type=epic --json`,
-		`bd ready --include-ephemeral --assignee="$cand" --exclude-type=epic --json`,
+	wantPresent := []string{
 		`bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json`,
+		`bd list --include-ephemeral --status in_progress --assignee="$cand" --json`,
+		`bd ready --include-ephemeral --assignee="$cand" --json`,
 		`-- gascity/control-dispatcher gascity/workflow-control`,
 	}
-	for _, want := range wantSnippets {
+	for _, want := range wantPresent {
 		if !strings.Contains(got, want) {
-			t.Errorf("EffectiveWorkQuery() missing exclude-type=epic on control-dispatcher tier:\n  want substring: %s\n  got: %s", want, got)
+			t.Errorf("EffectiveWorkQuery() missing expected substring on control-dispatcher:\n  want: %s\n  got: %s", want, got)
 		}
+	}
+	if bad := `--assignee="$cand" --exclude-type=epic`; strings.Contains(got, bad) {
+		t.Errorf("control-dispatcher assigned tier must not exclude epics, found: %s\n  got: %s", bad, got)
+	}
+}
+
+// TestEffectiveWorkQueryAssignedTierSurfacesEpicWisp verifies that a
+// self-assigned ephemeral epic (a "wisp" — the patrol-loop pattern used
+// by the gastown witness/refinery/deacon) is surfaced by the default
+// work query's assigned tiers. The fake bd here mimics real bd's
+// --exclude-type=epic behavior: it returns the epic wisp for a
+// `ready --assignee` query ONLY when --exclude-type=epic is absent.
+// Before the fix the assigned tier carried --exclude-type=epic and the
+// agent's own open wisp was dropped (gc hook exited 1 with no output);
+// the gc-udx parent-epic guard lives on the routed (Tier 3) query, which
+// still excludes epics — see TestEffectiveWorkQuerySkipsEpicLeafScenario.
+func TestEffectiveWorkQueryAssignedTierSurfacesEpicWisp(t *testing.T) {
+	a := Agent{Name: "witness", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ID":     "witness-sess",
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+case "$1" in
+  ready)
+    case "$*" in
+      *"--assignee=witness-sess"*"--exclude-type=epic"*)
+        # real bd drops the epic-typed wisp when epics are excluded
+        printf '[]' ;;
+      *"--assignee=witness-sess"*)
+        printf '[{"id":"patrol-wisp","issue_type":"epic","ephemeral":true}]' ;;
+      *) printf '[]' ;;
+    esac ;;
+  *) printf '[]' ;;
+esac
+`)
+	if !strings.Contains(out, "patrol-wisp") {
+		t.Fatalf("EffectiveWorkQuery() did not surface the self-assigned epic wisp (assigned tier still excludes epics?): %q", out)
 	}
 }
 
@@ -3399,6 +3538,48 @@ func TestValidateNonNegativeDurationsRejectsNegativeDoltStartAddressInUseRetryWi
 		!strings.Contains(err.Error(), "must not be negative") ||
 		!strings.Contains(err.Error(), `"-2s"`) {
 		t.Errorf("ValidateNonNegativeDurations() error = %q, want it to name the field, the constraint, and the value", err)
+	}
+}
+
+func TestValidateNonNegativeDurationsRejectsInvalidBeadPolicyDeleteAfterClose(t *testing.T) {
+	tests := []string{"-1h", "0s", "1d-48h", "200000d", "forever-ish"}
+	for _, value := range tests {
+		t.Run(value, func(t *testing.T) {
+			cfg := &City{
+				Beads: BeadsConfig{
+					Policies: map[string]BeadPolicyConfig{
+						"control": {DeleteAfterClose: value},
+					},
+				},
+			}
+			err := ValidateNonNegativeDurations(cfg, "city.toml")
+			if err == nil {
+				t.Fatal("ValidateNonNegativeDurations() = nil, want error for invalid delete_after_close")
+			}
+			msg := err.Error()
+			for _, want := range []string{"city.toml", "[beads.policies.control]", "delete_after_close", value} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("ValidateNonNegativeDurations() error = %q, want substring %q", msg, want)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateNonNegativeDurationsAllowsPositiveBeadPolicyDeleteAfterClose(t *testing.T) {
+	for _, value := range []string{"", "1h", "1d", "1d12h"} {
+		t.Run(value, func(t *testing.T) {
+			cfg := &City{
+				Beads: BeadsConfig{
+					Policies: map[string]BeadPolicyConfig{
+						"control": {DeleteAfterClose: value},
+					},
+				},
+			}
+			if err := ValidateNonNegativeDurations(cfg, "city.toml"); err != nil {
+				t.Errorf("ValidateNonNegativeDurations(delete_after_close=%q) = %v, want nil", value, err)
+			}
+		})
 	}
 }
 
