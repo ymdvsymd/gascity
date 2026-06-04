@@ -17,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/pricing"
+	"github.com/gastownhall/gascity/internal/remotesource"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
@@ -706,10 +707,10 @@ type PackSource struct {
 // optional version/export/transitive controls.
 type Import struct {
 	// Source is the durable authored pack location: a local path, a remote git
-	// URL, or a remote git URL with a monorepo subpath such as
-	// "github.com/org/repo//packs/foo". Registry handles are lookup-only in
-	// this release wave; authored [imports.*] entries store the resolved source
-	// plus optional version.
+	// URL, or a dereferenceable GitHub tree URL for a pack below a repository
+	// root, such as "https://github.com/org/repo/tree/main/packs/foo". Registry
+	// handles are lookup-only in this release wave; authored [imports.*]
+	// entries store the resolved source plus optional version.
 	Source string `toml:"source" jsonschema:"required"`
 	// Version is an optional semver constraint for git-backed imports (e.g.,
 	// "^1.2"). Empty for local paths. "sha:<hex>" pins a specific commit.
@@ -820,6 +821,9 @@ func legacyImportSourceFor(include string, packs map[string]PackSource) string {
 	if spec, ok := packs[include]; ok {
 		source := spec.Source
 		if spec.Path != "" {
+			if treeURL, ok := remotesource.FormatGitHubTreeSource(source, spec.Ref, spec.Path); ok {
+				return treeURL
+			}
 			source += "//" + strings.TrimPrefix(spec.Path, "/")
 		}
 		if spec.Ref != "" {
@@ -1255,6 +1259,11 @@ func (p BeadPolicyConfig) DeleteAfterCloseDuration() time.Duration {
 	return dur
 }
 
+// ProgressStallTimeoutMinimum is the minimum positive progress-stall recycle
+// timeout. Values below this floor are clamped so an opt-in automated restart
+// loop cannot spin faster than the storm-protection backstops can observe.
+const ProgressStallTimeoutMinimum = 5 * time.Minute
+
 // SessionConfig holds session provider settings.
 type SessionConfig struct {
 	// Provider selects the session backend: "fake", "fail", "subprocess",
@@ -1285,6 +1294,14 @@ type SessionConfig struct {
 	// StartupTimeout is how long to wait for each agent's Start() call before
 	// treating it as failed. Duration string (e.g., "60s", "2m"). Defaults to "60s".
 	StartupTimeout string `toml:"startup_timeout,omitempty" jsonschema:"default=60s"`
+	// ProgressStallTimeout, when set, enables progress-aware session recycling:
+	// a desired, alive, claim-less session on a healthy provider whose last
+	// provider-reported activity is older than this duration is restarted fresh.
+	// Such a session has likely parked (e.g. its turn ended on a provider auth
+	// error) and will not self-recover. Set this above the longest legitimate
+	// alive-idle period for the city; values below 5m are clamped to 5m.
+	// Duration string (e.g. "30m"). Unset/zero disables it.
+	ProgressStallTimeout string `toml:"progress_stall_timeout,omitempty"`
 	// Socket specifies the tmux socket name for per-city isolation.
 	// When set, all tmux commands use "tmux -L <socket>" to connect to
 	// a dedicated server. When empty, defaults to the city name
@@ -1359,6 +1376,29 @@ func (s *SessionConfig) StartupTimeoutDuration() time.Duration {
 	d, err := time.ParseDuration(s.StartupTimeout)
 	if err != nil {
 		return 60 * time.Second
+	}
+	return d
+}
+
+// ProgressStallTimeoutDuration returns the progress-stall recycle timeout, or
+// 0 when unset, zero, negative, or unparseable. Positive values below
+// ProgressStallTimeoutMinimum are clamped to that floor. Zero disables
+// progress-aware recycling (the default): only a city that explicitly opts in
+// by setting a duration above its agents' longest legitimate quiet period gets
+// the behavior.
+func (s *SessionConfig) ProgressStallTimeoutDuration() time.Duration {
+	if s.ProgressStallTimeout == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(s.ProgressStallTimeout)
+	if err != nil {
+		return 0
+	}
+	if d <= 0 {
+		return 0
+	}
+	if d < ProgressStallTimeoutMinimum {
+		return ProgressStallTimeoutMinimum
 	}
 	return d
 }
@@ -1565,6 +1605,15 @@ func (c EventsRotationConfig) ArchiveRetainAgeDuration() time.Duration {
 	return d
 }
 
+const (
+	// DefaultDoltMaxConnections is the managed Dolt listener connection cap.
+	DefaultDoltMaxConnections = 256
+	// DefaultDoltReadTimeoutMillis is the managed Dolt listener read timeout.
+	DefaultDoltReadTimeoutMillis = 30000
+	// DefaultDoltWriteTimeoutMillis is the managed Dolt listener write timeout.
+	DefaultDoltWriteTimeoutMillis = 300000
+)
+
 // DoltConfig holds optional dolt server overrides.
 // When present in city.toml, these override the defaults.
 type DoltConfig struct {
@@ -1578,6 +1627,48 @@ type DoltConfig struct {
 	// 1 enables archive compaction (higher CPU on startup).
 	// nil (omitted) defaults to 0.
 	ArchiveLevel *int `toml:"archive_level,omitempty" jsonschema:"default=0"`
+	// MaxConnections overrides the managed Dolt listener max_connections.
+	// 0 means use the managed default.
+	MaxConnections int `toml:"max_connections,omitempty" jsonschema:"default=256"`
+	// ReadTimeoutMillis overrides the managed Dolt listener read_timeout_millis.
+	// 0 means use the managed default.
+	ReadTimeoutMillis int `toml:"read_timeout_millis,omitempty" jsonschema:"default=30000"`
+	// WriteTimeoutMillis overrides the managed Dolt listener write_timeout_millis.
+	// 0 means use the managed default.
+	WriteTimeoutMillis int `toml:"write_timeout_millis,omitempty" jsonschema:"default=300000"`
+}
+
+// EffectiveArchiveLevel returns the configured Dolt archive level, defaulting
+// omitted values to 0.
+func (d DoltConfig) EffectiveArchiveLevel() int {
+	if d.ArchiveLevel != nil {
+		return *d.ArchiveLevel
+	}
+	return 0
+}
+
+// EffectiveMaxConnections returns the managed Dolt listener max_connections.
+func (d DoltConfig) EffectiveMaxConnections() int {
+	if d.MaxConnections > 0 {
+		return d.MaxConnections
+	}
+	return DefaultDoltMaxConnections
+}
+
+// EffectiveReadTimeoutMillis returns the managed Dolt listener read timeout.
+func (d DoltConfig) EffectiveReadTimeoutMillis() int {
+	if d.ReadTimeoutMillis > 0 {
+		return d.ReadTimeoutMillis
+	}
+	return DefaultDoltReadTimeoutMillis
+}
+
+// EffectiveWriteTimeoutMillis returns the managed Dolt listener write timeout.
+func (d DoltConfig) EffectiveWriteTimeoutMillis() int {
+	if d.WriteTimeoutMillis > 0 {
+		return d.WriteTimeoutMillis
+	}
+	return DefaultDoltWriteTimeoutMillis
 }
 
 // FormulasConfig holds legacy formula directory settings.
@@ -2025,6 +2116,14 @@ type DaemonConfig struct {
 	// false as a global kill switch (e.g., for production cities where a
 	// rebuild on the host should not auto-restart the supervisor).
 	AutoRestartOnDrift *bool `toml:"auto_restart_on_drift,omitempty" jsonschema:"default=true"`
+	// AutoReapClosedBeadWorktrees controls whether the reconciler patrol
+	// automatically removes per-bead git worktrees once their associated
+	// work bead reaches closed status. Only worktrees with a clean working
+	// tree, no unpushed commits, and no stashes are removed; unsafe worktrees
+	// are logged as warnings and left in place for operator review. Session
+	// home directories (agent template directories) are never touched.
+	// Defaults to false. Set to true to enable automated worktree cleanup.
+	AutoReapClosedBeadWorktrees *bool `toml:"auto_reap_closed_bead_worktrees,omitempty" jsonschema:"default=false"`
 	// StartReadyTimeout is how long `gc start` and `gc register` wait for
 	// the supervisor to report the city as Running. Cities with many
 	// registered or adopted sessions take longer to start because the
@@ -2045,6 +2144,14 @@ type DaemonConfig struct {
 	// behavior. Duration string (e.g., "250ms", "500ms"). Trade-off:
 	// adds tick latency up to this value when set.
 	TickDebounce string `toml:"tick_debounce,omitempty"`
+	// AutoPruneWorkerDir controls whether the reconciler removes a
+	// pool-managed session's worker_dir (agent worktree) after the session
+	// bead is closed. Removal is gated on: path lives under the city's
+	// .gc/worktrees/ tree, clean working tree, no unpushed commits, no
+	// stashed work. Nil (unset) defaults to true so pool worktrees do not
+	// accumulate without bound across pool recycles. Set to false to
+	// retain worktrees for post-session diagnostics.
+	AutoPruneWorkerDir *bool `toml:"auto_prune_worker_dir,omitempty" jsonschema:"default=true"`
 }
 
 // AutoRestartOnDriftEnabled reports whether the supervisor should be
@@ -2057,6 +2164,29 @@ func (d *DaemonConfig) AutoRestartOnDriftEnabled() bool {
 		return true
 	}
 	return *d.AutoRestartOnDrift
+}
+
+// AutoReapClosedBeadWorktreesEnabled reports whether the patrol should
+// automatically remove per-bead git worktrees for closed beads. Defaults
+// to false when the field is unset (nil). Set to true in city.toml to
+// enable automated cleanup.
+func (d *DaemonConfig) AutoReapClosedBeadWorktreesEnabled() bool {
+	if d.AutoReapClosedBeadWorktrees == nil {
+		return false
+	}
+	return *d.AutoReapClosedBeadWorktrees
+}
+
+// AutoPruneWorkerDirEnabled reports whether the reconciler should remove a
+// pool-managed session's worker_dir after the session bead is closed. The
+// default is true: pool worktrees are transient by design and accumulate
+// without bound otherwise. Removal is still gated on per-worktree safety
+// probes (clean tree, no unpushed commits, no stashes).
+func (d *DaemonConfig) AutoPruneWorkerDirEnabled() bool {
+	if d.AutoPruneWorkerDir == nil {
+		return true
+	}
+	return *d.AutoPruneWorkerDir
 }
 
 // PatrolIntervalDuration returns the patrol interval as a time.Duration.
@@ -3426,15 +3556,14 @@ func (a *Agent) EffectiveOnBoot() string {
 		`xargs -rI{} bd update {} --status open 2>/dev/null`
 }
 
-// InjectImplicitAgents adds on-demand agents for each configured provider at
-// both city scope and each rig scope. A provider is "configured" if it
-// appears in cfg.Providers, cfg.AgentDefaults.Provider, or
-// cfg.Workspace.Provider, so the common single-provider cases work without a
-// redundant [providers.claude] section. Unconfigured built-in providers are
-// skipped. Pool min=0, max=-1 (unlimited) so they are available as sling
-// targets without an explicit [[agent]] entry. Explicit agents always win: if
-// city.toml defines [[agent]] name="claude" (or a rig-scoped equivalent), no
-// implicit agent is added for that scope.
+// InjectImplicitAgents adds on-demand agents for each explicitly configured
+// provider at both city scope and each rig scope. A provider is configured
+// only when it appears in cfg.Providers; workspace.provider selects the
+// default from that catalog but does not create a catalog entry. Pool min=0,
+// max=-1 (unlimited) so they are available as sling targets without an
+// explicit [[agent]] entry. Explicit agents always win — if city.toml defines
+// [[agent]] name="claude" (or a rig-scoped equivalent), no implicit agent is
+// added for that scope.
 // agentKey identifies an agent by its rig directory and name.
 type agentKey struct{ dir, name string }
 
@@ -3716,33 +3845,14 @@ func newControlDispatcherAgent(dir string) Agent {
 	return a
 }
 
-// configuredProviders returns the merged set of providers that are explicitly
-// configured: the union of cfg.Providers keys, cfg.AgentDefaults.Provider, and
-// cfg.Workspace.Provider. Scalar provider defaults are only included if they
-// name a built-in provider or one already defined in cfg.Providers — a
-// non-builtin scalar default without a matching [providers.X] section is
-// ignored because it would create an implicit agent that fails at resolution
-// time.
+// configuredProviders returns the providers that are explicitly configured in
+// the provider catalog.
 func configuredProviders(cfg *City) map[string]ProviderSpec {
-	merged := make(map[string]ProviderSpec, len(cfg.Providers)+1)
+	merged := make(map[string]ProviderSpec, len(cfg.Providers))
 	for k, v := range cfg.Providers {
 		merged[k] = v
 	}
-	addScalarProviderDefault(merged, cfg.AgentDefaults.Provider)
-	addScalarProviderDefault(merged, cfg.Workspace.Provider)
 	return merged
-}
-
-func addScalarProviderDefault(merged map[string]ProviderSpec, name string) {
-	if name == "" {
-		return
-	}
-	if _, ok := merged[name]; ok {
-		return
-	}
-	if _, builtin := BuiltinProviders()[name]; builtin {
-		merged[name] = ProviderSpec{}
-	}
 }
 
 // configuredProviderOrder returns provider names from the map in a
@@ -4098,6 +4208,41 @@ func defaultInstallAgentHooksForProvider(provider string) []string {
 	}
 }
 
+func defaultInstallAgentHooksForProviders(providers []string) []string {
+	seen := map[string]bool{}
+	var hooks []string
+	for _, provider := range providers {
+		for _, hook := range defaultInstallAgentHooksForProvider(provider) {
+			if seen[hook] {
+				continue
+			}
+			seen[hook] = true
+			hooks = append(hooks, hook)
+		}
+	}
+	return hooks
+}
+
+func builtinProviderAliases(providers []string) map[string]ProviderSpec {
+	out := make(map[string]ProviderSpec)
+	for _, provider := range providers {
+		provider = strings.TrimSpace(provider)
+		if provider == "" {
+			continue
+		}
+		out[provider] = BuiltinProviderAlias(provider)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// EmptyCity returns a providerless city scaffold with no managed agents.
+func EmptyCity(name string) City {
+	return City{Workspace: Workspace{Name: name}}
+}
+
 // WizardCity returns a City with the given name, a workspace-level provider
 // or start command, and one agent (mayor). This is the config written by
 // "gc init" when the interactive wizard runs. If startCommand is set, it
@@ -4106,13 +4251,29 @@ func WizardCity(name, provider, startCommand string) City {
 	ws := Workspace{Name: name}
 	if startCommand != "" {
 		ws.StartCommand = startCommand
-	} else {
-		ws.Provider = provider
-		ws.InstallAgentHooks = defaultInstallAgentHooksForProvider(provider)
+		return City{
+			Workspace: ws,
+			Agents: []Agent{
+				{Name: "mayor", PromptTemplate: "prompts/mayor.md"},
+			},
+			NamedSessions: []NamedSession{{Template: "mayor", Mode: "always"}},
+		}
 	}
+	return WizardCityWithProviders(name, provider, []string{provider})
+}
+
+// WizardCityWithProviders returns a minimal managed city whose default
+// provider is selected from an explicit built-in provider catalog.
+func WizardCityWithProviders(name, defaultProvider string, providers []string) City {
+	ws := Workspace{Name: name}
+	if defaultProvider != "" {
+		ws.Provider = defaultProvider
+	}
+	ws.InstallAgentHooks = defaultInstallAgentHooksForProviders(providers)
 	return City{
 		Workspace: ws,
 		Daemon:    DaemonConfig{FormulaV2: true},
+		Providers: builtinProviderAliases(providers),
 		Agents: []Agent{
 			{Name: "mayor", PromptTemplate: "prompts/mayor.md"},
 		},
@@ -4133,13 +4294,30 @@ func GastownCity(name, provider, startCommand string) City {
 	}
 	if startCommand != "" {
 		ws.StartCommand = startCommand
-	} else if provider != "" {
-		ws.Provider = provider
-		ws.InstallAgentHooks = defaultInstallAgentHooksForProvider(provider)
+		return gastownCityWithWorkspace(name, ws, nil)
 	}
+	return GastownCityWithProviders(name, provider, []string{provider})
+}
+
+// GastownCityWithProviders returns a Gas Town city whose default provider is
+// selected from an explicit built-in provider catalog.
+func GastownCityWithProviders(name, defaultProvider string, providers []string) City {
+	ws := Workspace{
+		Name:            name,
+		GlobalFragments: []string{"command-glossary", "operational-awareness"},
+	}
+	if defaultProvider != "" {
+		ws.Provider = defaultProvider
+	}
+	ws.InstallAgentHooks = defaultInstallAgentHooksForProviders(providers)
+	return gastownCityWithWorkspace(name, ws, builtinProviderAliases(providers))
+}
+
+func gastownCityWithWorkspace(_ string, ws Workspace, providers map[string]ProviderSpec) City {
 	maxRestarts := 5
 	return City{
 		Workspace: ws,
+		Providers: providers,
 		Imports: map[string]Import{
 			"gastown": {
 				Source:  PublicGastownPackSource,
@@ -4211,6 +4389,9 @@ func Load(fs fsys.FS, path string) (*City, error) {
 		return nil, err
 	}
 	if err := ValidateGitHubPRMonitors(cfg); err != nil {
+		return nil, err
+	}
+	if err := ValidateDoltConfig(cfg, path); err != nil {
 		return nil, err
 	}
 	return cfg, nil

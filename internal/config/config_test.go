@@ -16,6 +16,34 @@ import (
 
 func strPtr(s string) *string { return &s }
 
+func TestBoundImportsFromLegacySourcesPrefersGitHubTreeURL(t *testing.T) {
+	got := BoundImportsFromLegacySources([]string{"ops", "slashy"}, map[string]PackSource{
+		"ops": {
+			Source: "https://github.com/acme/ops-pack.git",
+			Path:   "roles",
+			Ref:    "v1.2.3",
+		},
+		"slashy": {
+			Source: "https://github.com/acme/ops-pack.git",
+			Path:   "plans",
+			Ref:    "feature/slashy",
+		},
+	})
+	want := []BoundImport{
+		{
+			Binding: "ops",
+			Import:  Import{Source: "https://github.com/acme/ops-pack/tree/v1.2.3/roles"},
+		},
+		{
+			Binding: "slashy",
+			Import:  Import{Source: "https://github.com/acme/ops-pack.git//plans#feature/slashy"},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("BoundImportsFromLegacySources = %#v, want %#v", got, want)
+	}
+}
+
 func TestDefaultCity(t *testing.T) {
 	c := DefaultCity("bright-lights")
 	if c.Workspace.Name != "bright-lights" {
@@ -162,6 +190,51 @@ graph_workflows = false
 	}
 	if !strings.Contains(string(data), "formula_v2 = false") {
 		t.Fatalf("Marshal output should preserve canonical formula_v2=false:\n%s", data)
+	}
+}
+
+func TestParseDoltManagedListenerOverrides(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[workspace]
+name = "bright-lights"
+
+[dolt]
+read_timeout_millis = 300000
+write_timeout_millis = 600000
+max_connections = 1024
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Dolt.ReadTimeoutMillis != 300000 {
+		t.Fatalf("Dolt.ReadTimeoutMillis = %d, want 300000", cfg.Dolt.ReadTimeoutMillis)
+	}
+	if cfg.Dolt.WriteTimeoutMillis != 600000 {
+		t.Fatalf("Dolt.WriteTimeoutMillis = %d, want 600000", cfg.Dolt.WriteTimeoutMillis)
+	}
+	if cfg.Dolt.MaxConnections != 1024 {
+		t.Fatalf("Dolt.MaxConnections = %d, want 1024", cfg.Dolt.MaxConnections)
+	}
+}
+
+func TestLoadRejectsNegativeDoltManagedListenerOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "city.toml")
+	if err := os.WriteFile(path, []byte(`
+[workspace]
+name = "bright-lights"
+
+[dolt]
+read_timeout_millis = -1
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(fsys.OSFS{}, path)
+	if err == nil {
+		t.Fatal("Load() error = nil, want negative read_timeout_millis rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "[dolt] read_timeout_millis must not be negative") {
+		t.Fatalf("Load() error = %q, want read_timeout_millis rejection", got)
 	}
 }
 
@@ -3196,6 +3269,29 @@ func TestDaemonAutoRestartOnDriftExplicitFalse(t *testing.T) {
 	}
 }
 
+func TestDaemonAutoReapClosedBeadWorktreesDefault(t *testing.T) {
+	d := DaemonConfig{}
+	if d.AutoReapClosedBeadWorktreesEnabled() {
+		t.Errorf("AutoReapClosedBeadWorktreesEnabled() = true, want false (default)")
+	}
+}
+
+func TestDaemonAutoReapClosedBeadWorktreesExplicitTrue(t *testing.T) {
+	v := true
+	d := DaemonConfig{AutoReapClosedBeadWorktrees: &v}
+	if !d.AutoReapClosedBeadWorktreesEnabled() {
+		t.Errorf("AutoReapClosedBeadWorktreesEnabled() = false, want true")
+	}
+}
+
+func TestDaemonAutoReapClosedBeadWorktreesExplicitFalse(t *testing.T) {
+	v := false
+	d := DaemonConfig{AutoReapClosedBeadWorktrees: &v}
+	if d.AutoReapClosedBeadWorktreesEnabled() {
+		t.Errorf("AutoReapClosedBeadWorktreesEnabled() = true, want false (kill switch)")
+	}
+}
+
 func TestDaemonRestartWindowDefault(t *testing.T) {
 	d := DaemonConfig{}
 	got := d.RestartWindowDuration()
@@ -5685,10 +5781,14 @@ func TestInjectImplicitAgents_NoProviders(t *testing.T) {
 }
 
 func TestInjectImplicitAgents_WorkspaceProvider(t *testing.T) {
-	// workspace.provider alone is enough — no [providers.claude] section needed.
+	// workspace.provider selects a default but the provider catalog creates
+	// implicit agents.
 	cfg := &City{
 		Daemon:    DaemonConfig{FormulaV2: true},
 		Workspace: Workspace{Provider: "claude"},
+		Providers: map[string]ProviderSpec{
+			"claude": BuiltinProviderAlias("claude"),
+		},
 	}
 	InjectImplicitAgents(cfg)
 
@@ -5708,12 +5808,13 @@ func TestInjectImplicitAgents_WorkspaceProvider(t *testing.T) {
 }
 
 func TestInjectImplicitAgents_WorkspaceProviderPlusExplicit(t *testing.T) {
-	// workspace.provider = "claude" + [providers.codex] → both get implicit agents.
+	// [providers.claude] + [providers.codex] → both get implicit agents.
 	cfg := &City{
 		Daemon:    DaemonConfig{FormulaV2: true},
 		Workspace: Workspace{Provider: "claude"},
 		Providers: map[string]ProviderSpec{
-			"codex": {},
+			"claude": BuiltinProviderAlias("claude"),
+			"codex":  BuiltinProviderAlias("codex"),
 		},
 	}
 	InjectImplicitAgents(cfg)
@@ -6052,6 +6153,9 @@ func TestAgentDefaultsProvider_ExplicitOverrideWins(t *testing.T) {
 
 func TestAgentDefaultsProvider_InjectImplicitAgents(t *testing.T) {
 	cfg := &City{
+		Providers: map[string]ProviderSpec{
+			"codex": BuiltinProviderAlias("codex"),
+		},
 		AgentDefaults: AgentDefaults{
 			Provider: "codex",
 		},
@@ -6097,6 +6201,12 @@ func TestAgentDefaultsProvider_BeatsWorkspaceProviderForExplicitAgent(t *testing
 [workspace]
 name = "demo"
 provider = "claude"
+
+[providers.claude]
+base = "builtin:claude"
+
+[providers.codex]
+base = "builtin:codex"
 
 [agent_defaults]
 provider = "codex"
