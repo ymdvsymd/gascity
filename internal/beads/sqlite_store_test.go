@@ -1,6 +1,8 @@
 package beads
 
 import (
+	"errors"
+	"fmt"
 	"runtime"
 	"testing"
 	"time"
@@ -88,6 +90,65 @@ func TestSQLiteStoreReady(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreReadyHonorsTierMode(t *testing.T) {
+	s, err := OpenSQLiteStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() {
+		if c, ok := s.(interface{ CloseStore() error }); ok {
+			c.CloseStore() //nolint:errcheck
+		}
+	}()
+
+	history, err := s.Create(Bead{Title: "history", Type: "task"})
+	if err != nil {
+		t.Fatalf("create history: %v", err)
+	}
+	noHistory, err := s.Create(Bead{Title: "no history", Type: "task", NoHistory: true})
+	if err != nil {
+		t.Fatalf("create no history: %v", err)
+	}
+	ephemeral, err := s.Create(Bead{Title: "ephemeral", Type: "task", Ephemeral: true})
+	if err != nil {
+		t.Fatalf("create ephemeral: %v", err)
+	}
+
+	defaultReady, err := s.Ready()
+	if err != nil {
+		t.Fatalf("Ready(default): %v", err)
+	}
+	if readyIDs(defaultReady)[ephemeral.ID] {
+		t.Fatalf("Ready(default) included ephemeral row %q: %+v", ephemeral.ID, defaultReady)
+	}
+	if !readyIDs(defaultReady)[history.ID] || !readyIDs(defaultReady)[noHistory.ID] {
+		t.Fatalf("Ready(default) = %+v, want history and no-history rows", defaultReady)
+	}
+
+	wisps, err := s.Ready(ReadyQuery{TierMode: TierWisps})
+	if err != nil {
+		t.Fatalf("Ready(TierWisps): %v", err)
+	}
+	wispIDs := readyIDs(wisps)
+	if wispIDs[history.ID] {
+		t.Fatalf("Ready(TierWisps) included history row %q: %+v", history.ID, wisps)
+	}
+	if !wispIDs[noHistory.ID] || !wispIDs[ephemeral.ID] {
+		t.Fatalf("Ready(TierWisps) = %+v, want no-history and ephemeral rows", wisps)
+	}
+
+	both, err := s.Ready(ReadyQuery{TierMode: TierBoth})
+	if err != nil {
+		t.Fatalf("Ready(TierBoth): %v", err)
+	}
+	bothIDs := readyIDs(both)
+	for _, id := range []string{history.ID, noHistory.ID, ephemeral.ID} {
+		if !bothIDs[id] {
+			t.Fatalf("Ready(TierBoth) = %+v, missing %s", both, id)
+		}
+	}
+}
+
 func TestSQLiteStoreCloseStore(t *testing.T) {
 	settle := func() {
 		runtime.GC()
@@ -163,4 +224,94 @@ func TestSQLiteStoreNoLeakOnDiscard(t *testing.T) {
 	if residual > 5 {
 		t.Fatalf("SQLiteStore CloseStore did not release resources: residual goroutines=%d after %d open+close cycles (want <=5)", residual, n)
 	}
+}
+
+func readyIDs(rows []Bead) map[string]bool {
+	ids := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		ids[row.ID] = true
+	}
+	return ids
+}
+
+func TestIsSQLiteBusy(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("some other error"), false},
+		{errors.New("database is locked (5) (SQLITE_BUSY)"), true},
+		{errors.New("SQLITE_BUSY (5)"), true},
+		{errors.New("database is locked"), true},
+		{fmt.Errorf("sqlite update: begin tx: %w", errors.New("database is locked (5) (SQLITE_BUSY)")), true},
+	}
+	for _, tc := range cases {
+		if got := isSQLiteBusy(tc.err); got != tc.want {
+			t.Errorf("isSQLiteBusy(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestRetryOnBusy(t *testing.T) {
+	t.Run("succeeds_immediately", func(t *testing.T) {
+		calls := 0
+		err := retryOnBusy(func() error {
+			calls++
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("expected 1 call, got %d", calls)
+		}
+	})
+
+	t.Run("retries_on_busy_then_succeeds", func(t *testing.T) {
+		calls := 0
+		busyErr := errors.New("database is locked (5) (SQLITE_BUSY)")
+		err := retryOnBusy(func() error {
+			calls++
+			if calls < 3 {
+				return busyErr
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if calls != 3 {
+			t.Fatalf("expected 3 calls, got %d", calls)
+		}
+	})
+
+	t.Run("exhausts_retries_and_returns_busy_error", func(t *testing.T) {
+		calls := 0
+		busyErr := errors.New("database is locked (5) (SQLITE_BUSY)")
+		err := retryOnBusy(func() error {
+			calls++
+			return busyErr
+		})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if calls != 1+sqliteBusyRetryAttempts {
+			t.Fatalf("expected %d calls, got %d", 1+sqliteBusyRetryAttempts, calls)
+		}
+	})
+
+	t.Run("does_not_retry_non_busy_error", func(t *testing.T) {
+		calls := 0
+		err := retryOnBusy(func() error {
+			calls++
+			return errors.New("something else went wrong")
+		})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if calls != 1 {
+			t.Fatalf("expected 1 call, got %d", calls)
+		}
+	})
 }
