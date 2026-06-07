@@ -15,10 +15,12 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/hooks"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 )
 
@@ -438,15 +440,16 @@ func buildDesiredStateWithSessionBeads(
 	trace *sessionReconcilerTraceCycle,
 	stderr io.Writer,
 ) DesiredStateResult {
-	if cfg.Workspace.Suspended {
+	citySt, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
+	if effectiveCitySuspended(cfg, citySt) {
 		return DesiredStateResult{}
 	}
 
 	bp := newAgentBuildParams(cityName, cityPath, cfg, sp, beaconTime, store, stderr)
 	bp.sessionBeads = sessionBeads
 
-	// Pre-compute suspended rig paths.
-	suspendedRigPaths := buildSuspendedRigPaths(cfg)
+	// Pre-compute suspended rig paths (config + runtime state).
+	suspendedRigPaths := buildSuspendedRigPathsForCity(cfg, cityPath)
 
 	// Collect all open session beads from all stores to correctly count
 	// running sessions for each pool. A partial/failed collection is logged,
@@ -839,13 +842,21 @@ func buildDesiredStateWithSessionBeads(
 	}
 }
 
-func buildSuspendedRigPaths(cfg *config.City) map[string]bool {
+func buildSuspendedRigPathsForCity(cfg *config.City, cityPath string) map[string]bool {
 	if cfg == nil || len(cfg.Rigs) == 0 {
+		return nil
+	}
+	var suspState suspensionstate.State
+	if cityPath != "" {
+		suspState, _ = loadSuspensionState(fsys.OSFS{}, cityPath)
+	}
+	suspNames := buildEffectiveSuspendedRigNames(cfg, suspState)
+	if len(suspNames) == 0 {
 		return nil
 	}
 	suspendedRigPaths := make(map[string]bool)
 	for _, r := range cfg.Rigs {
-		if r.Suspended {
+		if suspNames[r.Name] {
 			suspendedRigPaths[filepath.Clean(r.Path)] = true
 		}
 	}
@@ -965,7 +976,7 @@ func refreshDesiredStateWithSessionBeads(
 
 	bp := newAgentBuildParams(cityName, cityPath, cfg, sp, result.BeaconTime, store, stderr)
 	bp.sessionBeads = sessionBeads
-	applySessionBeadDesiredOverlay(bp, cfg, refreshed.State, buildSuspendedRigPaths(cfg), result.PoolScaleCheckPartialTemplates, result.NamedScaleCheckPartialTemplates, stderr)
+	applySessionBeadDesiredOverlay(bp, cfg, refreshed.State, buildSuspendedRigPathsForCity(cfg, cityPath), result.PoolScaleCheckPartialTemplates, result.NamedScaleCheckPartialTemplates, stderr)
 	return refreshed
 }
 
@@ -1316,13 +1327,15 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 			counts[template]++
 		}
 
-		// Source 2: explicit pool-demand path. Two writers stamp the wisp
-		// when a.Pool != "" — doOrderRunWithJSON (cmd_order.go, the
-		// gc order run CLI path) and memoryOrderDispatcher.dispatchOne
-		// (order_dispatch.go, the supervisor's in-process cron path).
-		// Both write poolDemandMetadataPair() alongside the routing key,
-		// so cron-fired pool orders surface scale_check demand even when
-		// the wisp lands as a molecule that readyExcludeTypes filters out
+		// Source 2: explicit pool-demand path. Three writers stamp the
+		// wisp when it routes to a pool — doOrderRunWithJSON
+		// (cmd_order.go, the gc order run CLI path),
+		// memoryOrderDispatcher.dispatchOne (order_dispatch.go, the
+		// supervisor's in-process cron path), and slingFormula
+		// (internal/sling/sling_core.go, the gc sling --formula path —
+		// issue #2986). All write poolDemandMetadataPair() alongside the
+		// routing key, so pool-routed wisps surface scale_check demand
+		// even when they land as molecules that readyExcludeTypes filters out
 		// (per PR #1154 / issue #1039 — formula steps are not actionable
 		// work, the molecule is the container). The list filter is
 		// metadata-only (open + gc.pool_demand=<sentinel>); the
