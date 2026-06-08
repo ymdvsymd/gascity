@@ -26,7 +26,7 @@ var (
 )
 
 const (
-	reaperCloseCleanupEdgeSQL   = "(d.type = 'parent-child' OR (d.type = 'tracks' AND JSON_UNQUOTE(JSON_EXTRACT(w.metadata, '$.\"gc.root_bead_id\"')) = d.depends_on_id))"
+	reaperCloseCleanupEdgeSQL   = "(d.type = 'parent-child' OR (d.type = 'tracks' AND JSON_UNQUOTE(JSON_EXTRACT(w.metadata, '$.\"gc.root_bead_id\"')) = COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external)))"
 	reaperPurgeProtectEdgeSQL   = "d.type IN ('parent-child', 'tracks', 'blocks')"
 	reaperCloseCleanupPredicate = "WISP_CLOSE_EDGE_PREDICATE="
 	reaperPurgeProtectTypes     = "WISP_PURGE_PROTECT_EDGE_TYPES="
@@ -222,7 +222,8 @@ EOF
 EOF
 	      exit 0
 	    fi
-	    if [ "$2" = "update" ]; then
+	    if [ "$2" = "release-if-current" ]; then
+	      printf 'released\n'
 	      exit 0
 	    fi
     ;;
@@ -253,13 +254,161 @@ exit 1
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
 	log := string(logData)
-	if !strings.Contains(log, "bd update ga-orphan --status=open --assignee=") {
+	if !strings.Contains(log, "bd release-if-current ga-orphan project/gastown.missing") {
 		t.Fatalf("orphan bead was not reset:\n%s", log)
 	}
 	for _, preserved := range []string{"ga-valid", "ga-pool"} {
-		if strings.Contains(log, "bd update "+preserved+" ") {
+		if strings.Contains(log, "bd release-if-current "+preserved+" ") {
 			t.Fatalf("valid assignee %s was reset:\n%s", preserved, log)
 		}
+	}
+}
+
+// orphanSweepBareShortFormGCStub writes a gc stub whose only live session is
+// the qualified agent "thriva/devpipeline.backend_dev", while the sole
+// in-progress bead is assigned to the bare short form "backend_dev". When
+// sessionLive is false the session list is empty, so the canonical agent looks
+// dead. The bare assignee never matches a configured name, a pool template, a
+// dot-stripped form, or a live session identity directly — it can only be
+// resolved through the qualified-agent-is-live path under test.
+func orphanSweepBareShortFormGCStub(t *testing.T, binDir string, sessionLive bool) {
+	t.Helper()
+	sessionList := `{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}`
+	if sessionLive {
+		sessionList = `{"sessions":[` +
+			`{"id":"mc-bare-live","session_name":"thriva__devpipeline-backend-dev",` +
+			`"alias":"backend_dev-1","agent_name":"thriva/devpipeline.backend_dev","closed":false}` +
+			`],"summary":{},"filters":{},"schema_version":"1"}`
+	}
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+if [ "$1" = "--rig" ]; then
+  shift 2
+fi
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      cat <<'EOF'
+Agent: thriva/devpipeline.backend_dev
+  source: pack
+EOF
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '%s\n' '`+sessionList+`'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "show" ] && [ "$3" = "ga-bare" ] && [ "$4" = "--json" ]; then
+      cat <<'EOF'
+[
+  {"id":"ga-bare","status":"in_progress","assignee":"backend_dev"}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "list" ]; then
+      cat <<'EOF'
+[
+  {"id":"ga-bare","status":"in_progress","assignee":"backend_dev"}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "release-if-current" ]; then
+      printf 'released\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+}
+
+// TestOrphanSweepPreservesBareShortFormOfLiveQualifiedAgent verifies that a
+// bead assigned to the bare short form "backend_dev" is preserved when the
+// configured qualified agent "thriva/devpipeline.backend_dev" has a live
+// session known only by its qualified name. Without the qualified-agent-is-live
+// resolution, the live owner's in-progress work would be reset every cycle.
+func TestOrphanSweepPreservesBareShortFormOfLiveQualifiedAgent(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	orphanSweepBareShortFormGCStub(t, binDir, true)
+
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	script := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "orphan-sweep.sh")
+	cmd := exec.Command(script)
+	cmd.Env = mergeTestEnv(env)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+	}
+	if strings.Contains(string(out), "orphan-sweep: reset") {
+		t.Fatalf("live qualified agent's bare-short-form assignee was swept:\n%s", out)
+	}
+
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if log := string(logData); strings.Contains(log, "bd release-if-current ga-bare ") {
+		t.Fatalf("bare-short-form bead of live qualified agent was reset:\n%s", log)
+	}
+}
+
+// TestOrphanSweepResetsBareShortFormWhenQualifiedAgentDead is the negative
+// control for TestOrphanSweepPreservesBareShortFormOfLiveQualifiedAgent: with
+// no live session for the qualified agent, the same bare "backend_dev" bead is
+// a genuine orphan and must still be reset. This proves the live-owner
+// preservation did not weaken the sweep.
+func TestOrphanSweepResetsBareShortFormWhenQualifiedAgentDead(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	orphanSweepBareShortFormGCStub(t, binDir, false)
+
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	script := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "orphan-sweep.sh")
+	cmd := exec.Command(script)
+	cmd.Env = mergeTestEnv(env)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+	}
+	if !strings.Contains(string(out), "orphan-sweep: reset 1 orphaned beads") {
+		t.Fatalf("dead qualified agent's bare-short-form bead was not swept:\n%s", out)
+	}
+
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if log := string(logData); !strings.Contains(log, "bd release-if-current ga-bare backend_dev") {
+		t.Fatalf("orphan bead was not reset:\n%s", log)
 	}
 }
 
@@ -326,7 +475,8 @@ EOF
 EOF
 	      exit 0
 	    fi
-	    if [ "$2" = "update" ]; then
+	    if [ "$2" = "release-if-current" ]; then
+	      printf 'released\n'
 	      exit 0
 	    fi
     ;;
@@ -360,11 +510,11 @@ exit 1
 	if !strings.Contains(log, "config show") {
 		t.Fatalf("fallback config show path was not exercised:\n%s", log)
 	}
-	if !strings.Contains(log, "bd update ga-orphan --status=open --assignee=") {
+	if !strings.Contains(log, "bd release-if-current ga-orphan gastown.missing") {
 		t.Fatalf("orphan bead was not reset:\n%s", log)
 	}
 	for _, preserved := range []string{"ga-valid", "ga-pool"} {
-		if strings.Contains(log, "bd update "+preserved+" ") {
+		if strings.Contains(log, "bd release-if-current "+preserved+" ") {
 			t.Fatalf("valid assignee %s was reset:\n%s", preserved, log)
 		}
 	}
@@ -651,6 +801,106 @@ exit 1
 	}
 }
 
+func TestOrphanSweepUsesConditionalResetAfterRevalidation(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      cat <<'EOF'
+Agent: project/worker
+  source: pack
+EOF
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      cat <<'EOF'
+[
+  {"id":"ga-raced-after-show","status":"in_progress","assignee":"project__worker-gc-mc-wisp-raced"}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = "ga-raced-after-show" ] && [ "$4" = "--json" ]; then
+      cat <<'EOF'
+[
+  {"id":"ga-raced-after-show","status":"in_progress","assignee":"project__worker-gc-mc-wisp-raced","metadata":{}}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = "mc-wisp-raced" ] && [ "$4" = "--json" ]; then
+      cat <<'EOF'
+[
+  {"id":"mc-wisp-raced","status":"closed","issue_type":"session","metadata":{"state":"closed"}}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "release-if-current" ] && [ "$3" = "ga-raced-after-show" ] && [ "$4" = "project__worker-gc-mc-wisp-raced" ]; then
+      printf 'skipped\n'
+      exit 0
+    fi
+    if [ "$2" = "update" ]; then
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	script := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "orphan-sweep.sh")
+	cmd := exec.Command(script)
+	cmd.Env = mergeTestEnv(env)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+	}
+	if strings.Contains(string(out), "orphan-sweep: reset") {
+		t.Fatalf("conditional reset skip was counted as a reset:\n%s", out)
+	}
+
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "bd show ga-raced-after-show --json") {
+		t.Fatalf("work bead was not revalidated before reset:\n%s", log)
+	}
+	if !strings.Contains(log, "bd release-if-current ga-raced-after-show project__worker-gc-mc-wisp-raced") {
+		t.Fatalf("work bead reset did not use conditional helper:\n%s", log)
+	}
+	if strings.Contains(log, "bd update ga-raced-after-show ") {
+		t.Fatalf("stale bead was reset with unconditional update:\n%s", log)
+	}
+}
+
 func TestOrphanSweepUsesSessionBeadShowWhenSessionListLags(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -749,6 +999,218 @@ exit 1
 	}
 }
 
+func TestOrphanSweepPreservesWorkWhenSessionBeadProbeErrors(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      cat <<'EOF'
+Agent: project/worker
+  source: pack
+EOF
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      cat <<'EOF'
+[
+  {"id":"ga-session-probe-error","status":"in_progress","assignee":"project__worker-gc-mc-wisp-live123"}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = "ga-session-probe-error" ] && [ "$4" = "--json" ]; then
+      cat <<'EOF'
+[
+  {"id":"ga-session-probe-error","status":"in_progress","assignee":"project__worker-gc-mc-wisp-live123","metadata":{"gc.session_name":"project__worker-gc-mc-wisp-live123"}}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = "mc-wisp-live123" ] && [ "$4" = "--json" ]; then
+      printf 'transient read failure\n' >&2
+      exit 2
+    fi
+    if [ "$2" = "release-if-current" ]; then
+      printf 'released\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	script := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "orphan-sweep.sh")
+	cmd := exec.Command(script)
+	cmd.Env = mergeTestEnv(env)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+	}
+	if !strings.Contains(string(out), "orphan-sweep: reset 0 orphaned beads, skipped 1 unverifiable") {
+		t.Fatalf("unexpected orphan-sweep output:\n%s", out)
+	}
+
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "bd show mc-wisp-live123 --json") {
+		t.Fatalf("session bead candidate was not probed:\n%s", log)
+	}
+	if strings.Contains(log, "bd release-if-current ga-session-probe-error ") {
+		t.Fatalf("session probe error fell through to reset:\n%s", log)
+	}
+}
+
+func TestOrphanSweepUsesDirectSessionBeadCandidatesWhenSessionListLags(t *testing.T) {
+	tests := []struct {
+		name      string
+		workID    string
+		assignee  string
+		sessionID string
+	}{
+		{
+			name:      "bare session bead assignee",
+			workID:    "ga-bare-session-bead",
+			assignee:  "mc-live-rig-asleep",
+			sessionID: "mc-live-rig-asleep",
+		},
+		{
+			name:      "generic mc suffix",
+			workID:    "ga-generic-mc-suffix",
+			assignee:  "project__worker-gc-mc-live-rig-asleep",
+			sessionID: "mc-live-rig-asleep",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cityDir := t.TempDir()
+			binDir := t.TempDir()
+			gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+			writeExecutable(t, filepath.Join(binDir, "gc"), fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> "$GC_CALL_LOG"
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      cat <<'EOF'
+Agent: project/worker
+  source: pack
+EOF
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      cat <<'EOF'
+[
+  {"id":%q,"status":"in_progress","assignee":%q}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = %q ] && [ "$4" = "--json" ]; then
+      cat <<'EOF'
+[
+  {"id":%q,"status":"in_progress","assignee":%q}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = %q ] && [ "$4" = "--json" ]; then
+      cat <<'EOF'
+[
+  {"id":%q,"status":"open","issue_type":"session","metadata":{"state":"active","session_name":%q}}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "update" ]; then
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`, tt.workID, tt.assignee, tt.workID, tt.workID, tt.assignee, tt.sessionID, tt.sessionID, tt.assignee))
+
+			env := map[string]string{
+				"GC_CITY":      cityDir,
+				"GC_CITY_PATH": cityDir,
+				"GC_CALL_LOG":  gcLog,
+				"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+			}
+
+			script := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "orphan-sweep.sh")
+			cmd := exec.Command(script)
+			cmd.Env = mergeTestEnv(env)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+			}
+			if strings.Contains(string(out), "orphan-sweep: reset") {
+				t.Fatalf("unexpected orphan reset output:\n%s", out)
+			}
+
+			logData, err := os.ReadFile(gcLog)
+			if err != nil {
+				t.Fatalf("ReadFile(gc log): %v", err)
+			}
+			log := string(logData)
+			for _, want := range []string{
+				"bd show " + tt.workID + " --json",
+				"bd show " + tt.sessionID + " --json",
+			} {
+				if !strings.Contains(log, want) {
+					t.Fatalf("missing required gc call %q:\n%s", want, log)
+				}
+			}
+			if strings.Contains(log, "bd update "+tt.workID+" ") {
+				t.Fatalf("session-list lag caused live assigned work to reset:\n%s", log)
+			}
+		})
+	}
+}
+
 func TestOrphanSweepPreservesRigScopedLiveEphemeralSessionAssigneesFromCurrentSchema(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -825,7 +1287,8 @@ EOF
 EOF
 	      exit 0
 	    fi
-	    if [ "$2" = "update" ]; then
+	    if [ "$2" = "release-if-current" ]; then
+	      printf 'released\n'
 	      exit 0
 	    fi
     ;;
@@ -859,14 +1322,14 @@ exit 1
 	if !strings.Contains(log, "--rig project session list --json") {
 		t.Fatalf("rig-scoped session list was not queried:\n%s", log)
 	}
-	if !strings.Contains(log, "bd update ga-rig-orphan --status=open --assignee=") {
+	if !strings.Contains(log, "bd release-if-current ga-rig-orphan missing-rig-session") {
 		t.Fatalf("rig orphan bead was not reset:\n%s", log)
 	}
-	if !strings.Contains(log, "bd update ga-rig-closed-default-filtered --status=open --assignee=") {
+	if !strings.Contains(log, "bd release-if-current ga-rig-closed-default-filtered project__worker-gc-closed") {
 		t.Fatalf("closed/default-filtered session assignee was not reset:\n%s", log)
 	}
 	for _, preserved := range []string{"ga-rig-live-by-session-name", "ga-rig-live-by-id"} {
-		if strings.Contains(log, "bd update "+preserved+" ") {
+		if strings.Contains(log, "bd release-if-current "+preserved+" ") {
 			t.Fatalf("rig live ephemeral session assignee %s was reset:\n%s", preserved, log)
 		}
 	}
@@ -948,7 +1411,8 @@ EOF
 EOF
 	      exit 0
 	    fi
-	    if [ "$2" = "update" ]; then
+	    if [ "$2" = "release-if-current" ]; then
+	      printf 'released\n'
 	      exit 0
 	    fi
     ;;
@@ -980,12 +1444,15 @@ exit 1
 	}
 	log := string(logData)
 	for _, preserved := range []string{"ga-live-by-id", "ga-live-by-session-name"} {
-		if strings.Contains(log, "bd update "+preserved+" ") {
+		if strings.Contains(log, "bd release-if-current "+preserved+" ") {
 			t.Fatalf("forward-compatible PascalCase session assignee %s was reset:\n%s", preserved, log)
 		}
 	}
-	for _, reset := range []string{"ga-closed-session", "ga-missing-session"} {
-		if !strings.Contains(log, "bd update "+reset+" --status=open --assignee=") {
+	for reset, assignee := range map[string]string{
+		"ga-closed-session":  "vgc-closed",
+		"ga-missing-session": "missing-session",
+	} {
+		if !strings.Contains(log, "bd release-if-current "+reset+" "+assignee) {
 			t.Fatalf("expected %s to be reset:\n%s", reset, log)
 		}
 	}
@@ -1068,7 +1535,8 @@ EOF
 EOF
 	      exit 0
 	    fi
-	    if [ "$2" = "update" ]; then
+	    if [ "$2" = "release-if-current" ]; then
+	      printf 'released\n'
 	      exit 0
 	    fi
     ;;
@@ -1099,12 +1567,15 @@ exit 1
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
 	log := string(logData)
-	for _, reset := range []string{"ga-hq-orphan", "ga-healthy-orphan"} {
-		if !strings.Contains(log, "bd update "+reset+" --status=open --assignee=") {
+	for reset, assignee := range map[string]string{
+		"ga-hq-orphan":      "missing-hq-session",
+		"ga-healthy-orphan": "missing-healthy-session",
+	} {
+		if !strings.Contains(log, "bd release-if-current "+reset+" "+assignee) {
 			t.Fatalf("expected %s to be reset after partial rig failure:\n%s", reset, log)
 		}
 	}
-	if strings.Contains(log, "bd update ga-broken-orphan ") {
+	if strings.Contains(log, "bd release-if-current ga-broken-orphan ") {
 		t.Fatalf("bead from rig with unknown session liveness was reset:\n%s", log)
 	}
 }
@@ -1244,11 +1715,11 @@ func TestOrphanSweepPreservesProtectedInProgressEphemeralMoleculeWisp(t *testing
 			}
 			log := string(logData)
 			lines := nonEmptyLogLines(log)
-			orphanUpdate := "bd update " + tt.orphanID + " --status=open --assignee="
+			orphanUpdate := "bd release-if-current " + tt.orphanID + " " + tt.orphanAssignee
 			if got := countExactLine(lines, orphanUpdate); got != 1 {
 				t.Fatalf("orphan update count = %d, want 1 for %q\n%s", got, orphanUpdate, orphanSweepFailureContext(out, gcLog))
 			}
-			if strings.Contains(log, "bd update "+tt.protectedID+" ") {
+			if strings.Contains(log, "bd release-if-current "+tt.protectedID+" ") {
 				t.Fatalf("protected wisp %s was reset\n%s", tt.protectedID, orphanSweepFailureContext(out, gcLog))
 			}
 			if strings.Contains(log, "UNEXPECTED:") {
@@ -1318,12 +1789,16 @@ if [ "$*" = "session list --json" ]; then
   fi
   exit 0
 fi
-if [ "$*" = "bd update $ORPHAN_SWEEP_ORPHAN_ID --status=open --assignee=" ]; then
+if [ "$*" = "bd release-if-current $ORPHAN_SWEEP_ORPHAN_ID $ORPHAN_SWEEP_ORPHAN_ASSIGNEE" ]; then
+  printf 'released\n'
   exit 0
 fi
 if [ "$*" = "bd show $ORPHAN_SWEEP_ORPHAN_ID --json" ]; then
   printf '[{"id":"%s","status":"in_progress","assignee":"%s","metadata":{}}]\n' "$ORPHAN_SWEEP_ORPHAN_ID" "$ORPHAN_SWEEP_ORPHAN_ASSIGNEE"
   exit 0
+fi
+if [ "$*" = "bd show $ORPHAN_SWEEP_ORPHAN_ASSIGNEE --json" ]; then
+  exit 1
 fi
 printf 'UNEXPECTED: %s\n' "$*" >> "$GC_CALL_LOG"
 printf 'UNEXPECTED: %s\n' "$*" >&2
@@ -2614,8 +3089,8 @@ func TestReaperFormulaSQLReflectsCurrentSchema(t *testing.T) {
 		if strings.Contains(fence, "parent_id") {
 			t.Errorf("formula sql fence %d references parent_id (column does not exist in wisps):\n%s", i, fence)
 		}
-		if strings.Contains(fence, "depends_on_wisp_id") || strings.Contains(fence, "depends_on_issue_id") {
-			t.Errorf("formula sql fence %d references split dependency target columns; bd 1.0.4 uses depends_on_id:\n%s", i, fence)
+		if strings.Contains(fence, "depends_on_id") && !strings.Contains(fence, "depends_on_issue_id") && !strings.Contains(fence, "depends_on_wisp_id") {
+			t.Errorf("formula sql fence %d references removed depends_on_id column; schema uses typed split columns:\n%s", i, fence)
 		}
 		if strings.Contains(fence, "LEFT JOIN wisps parent ON") {
 			t.Errorf("formula sql fence %d still has the broken parent self-join:\n%s", i, fence)
@@ -2723,9 +3198,9 @@ exit 0
 	if strings.Contains(log, "parent_id") {
 		t.Errorf("reaper SQL references parent_id (column does not exist in wisps):\n%s", log)
 	}
-	for _, notWant := range []string{"depends_on_wisp_id", "depends_on_issue_id"} {
-		if strings.Contains(log, notWant) {
-			t.Errorf("reaper SQL references split dependency target column %q; bd 1.0.4 uses depends_on_id:\n%s", notWant, log)
+	for _, want := range []string{"depends_on_wisp_id", "depends_on_issue_id"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("reaper SQL missing split dependency target column %q; schema uses typed columns:\n%s", want, log)
 		}
 	}
 	// mail was removed: not a SQL table; messages are beads with type=message.
@@ -2736,7 +3211,7 @@ exit 0
 		"SHOW COLUMNS FROM `beads`.dependencies",
 		"SHOW COLUMNS FROM `beads`.wisp_dependencies",
 		"FROM `beads`.wisp_dependencies d",
-		"SELECT DISTINCT d.depends_on_id",
+		"SELECT DISTINCT d.depends_on_wisp_id",
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("reaper SQL missing %q:\n%s", want, log)
@@ -2767,7 +3242,7 @@ exit 0
 		purgeSQL := log[purgeIdx:]
 		if !strings.Contains(purgeSQL, "child_wisp.status IN ('open', 'hooked', 'in_progress')") ||
 			!containsReaperPurgeProtectEdgePredicate(purgeSQL) ||
-			!strings.Contains(purgeSQL, "SELECT DISTINCT d.depends_on_id") {
+			!strings.Contains(purgeSQL, "SELECT DISTINCT d.depends_on_wisp_id") {
 			t.Errorf("reaper purge can delete closed parents with non-closed children:\n%s", purgeSQL)
 		}
 	}
@@ -2818,7 +3293,7 @@ exit 0
 		t.Fatalf("reaper did not probe dependency target columns:\n%s", log)
 	}
 	if strings.Contains(log, "FROM `beads`.wisp_dependencies d") || strings.Contains(log, "JOIN `beads`.wisp_dependencies d") {
-		t.Fatalf("reaper ran dependency-aware queries against schema without depends_on_id:\n%s", log)
+		t.Fatalf("reaper ran dependency-aware queries against schema without typed dependency target columns:\n%s", log)
 	}
 
 	// A silently-skipped DB may make no gc calls at all, so a missing
@@ -2827,7 +3302,7 @@ exit 0
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
-	if strings.Contains(string(gcData), "dependencies table lacks depends_on_id") {
+	if strings.Contains(string(gcData), "dependencies table lacks") {
 		t.Errorf("reaper escalated the dependency schema as an anomaly; the target-column gate must skip silently:\n%s", gcData)
 	}
 }
@@ -2878,6 +3353,72 @@ exit 0
 	}
 	if strings.Contains(string(gcData), "wisp_dependencies") {
 		t.Errorf("reaper escalated the missing wisp dependency table as an anomaly; the schema gate must skip silently:\n%s", gcData)
+	}
+}
+
+func TestReaperSplitSchemaQueriesUseSplitColumns(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeMaintenanceDoltStub(t, filepath.Join(binDir, "dolt"))
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+
+	env := map[string]string{
+		"DOLT_ARGS_LOG":               doltLog,
+		"GC_CALL_LOG":                 gcLog,
+		"DOLT_DBS":                    "beads",
+		"DOLT_DEPENDENCY_SCHEMA":      "split",
+		"DOLT_WISP_DEPENDENCY_SCHEMA": "split",
+		"GC_CITY":                     cityDir,
+		"GC_CITY_PATH":                cityDir,
+		"GC_DOLT_HOST":                "127.0.0.1",
+		"GC_DOLT_PORT":                "3307",
+		"GC_DOLT_USER":                "root",
+		"GC_DOLT_PASSWORD":            "",
+		"DOLT_PURGE_COUNT":            "1",
+		"PATH":                        binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh"), env)
+
+	logData, err := os.ReadFile(doltLog)
+	if err != nil {
+		t.Fatalf("ReadFile(dolt log): %v", err)
+	}
+	log := string(logData)
+
+	for _, want := range []string{
+		"SHOW COLUMNS FROM `beads`.dependencies",
+		"SHOW COLUMNS FROM `beads`.wisp_dependencies",
+		"FROM `beads`.wisp_dependencies d",
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("reaper split-schema log missing %q:\n%s", want, log)
+		}
+	}
+
+	for _, splitCol := range []string{"depends_on_issue_id", "depends_on_wisp_id"} {
+		if !strings.Contains(log, splitCol) {
+			t.Errorf("reaper split-schema log missing split column %q:\n%s", splitCol, log)
+		}
+	}
+
+	// With split schema, queries against dependencies must not use the removed depends_on_id column.
+	// Filter out SHOW COLUMNS lines (which contain the table name, not the column reference in queries).
+	var queryLines []string
+	for _, line := range strings.Split(log, "\n") {
+		if !strings.Contains(line, "SHOW COLUMNS") {
+			queryLines = append(queryLines, line)
+		}
+	}
+	queryLog := strings.Join(queryLines, "\n")
+	if strings.Contains(queryLog, "d.depends_on_id") {
+		t.Errorf("reaper split-schema queries reference removed column d.depends_on_id:\n%s", queryLog)
 	}
 }
 
@@ -3728,8 +4269,8 @@ exit 0
 	if !strings.Contains(log, "wisp_dependencies d") || !containsReaperCloseCleanupEdgePredicate(log) {
 		t.Fatalf("reaper stale-wisp close path does not use graph cleanup-edge dependencies:\n%s", log)
 	}
-	if !strings.Contains(log, "d.depends_on_id = parent_wisp.id") || !strings.Contains(log, "d.depends_on_id = parent_issue.id") {
-		t.Fatalf("reaper stale-wisp close path does not use bd 1.0.4 dependency target column:\n%s", log)
+	if !strings.Contains(log, "d.depends_on_wisp_id = parent_wisp.id") || !strings.Contains(log, "d.depends_on_issue_id = parent_issue.id") {
+		t.Fatalf("reaper stale-wisp close path does not use typed dependency target columns:\n%s", log)
 	}
 	if strings.Contains(log, "parent_wisp.id IS NULL AND parent_issue.id IS NULL") {
 		t.Fatalf("reaper closes stale wisps when parent liveness is unresolved:\n%s", log)
@@ -3811,7 +4352,9 @@ case "$*" in
   *"SHOW COLUMNS FROM"*"dependencies"*)
     printf 'Field,Type,Null,Key,Default,Extra\n'
     printf 'issue_id,varchar,NO,,,\n'
-    printf 'depends_on_id,varchar,NO,,,\n'
+    printf 'depends_on_issue_id,varchar,YES,,,\n'
+    printf 'depends_on_wisp_id,varchar,YES,,,\n'
+    printf 'depends_on_external,varchar,YES,,,\n'
     printf 'type,varchar,NO,,,\n'
     ;;
   *"WITH RECURSIVE workflow_wisp_root_candidates"*"UPDATE "*"wisps SET status='closed'"*"JSON_SET(COALESCE(metadata, JSON_OBJECT())"*)
@@ -3896,8 +4439,8 @@ exit 0
 		"descendant_wisp.status, descendant_issue.status) IN ('open', 'hooked', 'in_progress', 'blocked', 'deferred', 'pinned', 'review', 'testing')",
 		"roots_with_recent_descendants",
 		"child_dep.type IN ('parent-child', 'tracks', 'blocks')",
-		"child_dep.depends_on_id = root.id",
-		"child_dep.depends_on_id = parent.id",
+		"COALESCE(child_dep.depends_on_issue_id, child_dep.depends_on_wisp_id, child_dep.depends_on_external) = root.id",
+		"COALESCE(child_dep.depends_on_issue_id, child_dep.depends_on_wisp_id, child_dep.depends_on_external) = parent.id",
 		"workflow_roots=2",
 	} {
 		if !strings.Contains(log, want) {
@@ -3961,7 +4504,9 @@ case "$*" in
   *"SHOW COLUMNS FROM"*"dependencies"*)
     printf 'Field,Type,Null,Key,Default,Extra\n'
     printf 'issue_id,varchar,NO,,,\n'
-    printf 'depends_on_id,varchar,NO,,,\n'
+    printf 'depends_on_issue_id,varchar,YES,,,\n'
+    printf 'depends_on_wisp_id,varchar,YES,,,\n'
+    printf 'depends_on_external,varchar,YES,,,\n'
     printf 'type,varchar,NO,,,\n'
     ;;
   *"WITH RECURSIVE workflow_wisp_root_candidates"*"SELECT COUNT(*) FROM ("*)
@@ -4054,7 +4599,9 @@ case "$*" in
   *"SHOW COLUMNS FROM"*"dependencies"*)
     printf 'Field,Type,Null,Key,Default,Extra\n'
     printf 'issue_id,varchar,NO,,,\n'
-    printf 'depends_on_id,varchar,NO,,,\n'
+    printf 'depends_on_issue_id,varchar,YES,,,\n'
+    printf 'depends_on_wisp_id,varchar,YES,,,\n'
+    printf 'depends_on_external,varchar,YES,,,\n'
     printf 'type,varchar,NO,,,\n'
     ;;
   *"WITH RECURSIVE workflow_wisp_root_candidates"*"SELECT COUNT(*) FROM ("*)
@@ -6069,7 +6616,7 @@ case "$*" in
   ;;
 *"SHOW COLUMNS FROM"*"dependencies"*)
   printf 'Field,Type,Null,Key,Default,Extra\n'
-  dependency_schema="${DOLT_DEPENDENCY_SCHEMA:-generic}"
+  dependency_schema="${DOLT_DEPENDENCY_SCHEMA:-split}"
   case "$*" in
     *"wisp_dependencies"*) dependency_schema="${DOLT_WISP_DEPENDENCY_SCHEMA:-$dependency_schema}" ;;
   esac
@@ -6087,7 +6634,9 @@ case "$*" in
     printf 'type,varchar,NO,,,\n'
   else
     printf 'issue_id,varchar,NO,,,\n'
-    printf 'depends_on_id,varchar,NO,,,\n'
+    printf 'depends_on_issue_id,varchar,YES,,,\n'
+    printf 'depends_on_wisp_id,varchar,YES,,,\n'
+    printf 'depends_on_external,varchar,YES,,,\n'
     printf 'type,varchar,NO,,,\n'
   fi
   ;;
@@ -6150,7 +6699,9 @@ case "$*" in
 *"SHOW COLUMNS FROM"*"dependencies"*)
   printf 'Field,Type,Null,Key,Default,Extra\n'
   printf 'issue_id,varchar,NO,,,\n'
-  printf 'depends_on_id,varchar,NO,,,\n'
+  printf 'depends_on_issue_id,varchar,YES,,,\n'
+  printf 'depends_on_wisp_id,varchar,YES,,,\n'
+  printf 'depends_on_external,varchar,YES,,,\n'
   printf 'type,varchar,NO,,,\n'
   ;;
 *"UPDATE "*"wisps SET status='closed'"*)

@@ -211,6 +211,7 @@ type startResult struct {
 // session_key is set, CommitRefresh only on the async path).
 type startPhaseTimings struct {
 	StartCall         time.Duration // startPreparedStartCandidate total (provider Start + any ErrStateSync recovery)
+	ZombieRecycle     time.Duration // provider Stop of a running session whose agent process died (subset of StartCall; ga-yms)
 	StateSyncRecovery time.Duration // workerSessionTargetRunningWithConfig branch when provider Start returned ErrStateSync (subset of StartCall; gc-9ha)
 	PostStartObserve  time.Duration // staleKeyDetectDelay + workerObserveSessionTarget when session_key present
 	CommitRefresh     time.Duration // refreshAsyncStartResult bead reload (async path only)
@@ -227,12 +228,15 @@ type startPhaseTimings struct {
 // 0.5ms doesn't print as "...=0s" (which would be misleading and
 // defeat the elision intent). Sub-ms durations are dropped entirely.
 func (p startPhaseTimings) formatLog() string {
-	if p.StartCall == 0 && p.StateSyncRecovery == 0 && p.PostStartObserve == 0 && p.CommitRefresh == 0 {
+	if p.StartCall == 0 && p.ZombieRecycle == 0 && p.StateSyncRecovery == 0 && p.PostStartObserve == 0 && p.CommitRefresh == 0 {
 		return ""
 	}
 	var parts []string
 	if r := p.StartCall.Round(time.Millisecond); r > 0 {
 		parts = append(parts, fmt.Sprintf("start_call=%s", r))
+	}
+	if r := p.ZombieRecycle.Round(time.Millisecond); r > 0 {
+		parts = append(parts, fmt.Sprintf("zombie_recycle=%s", r))
 	}
 	if r := p.StateSyncRecovery.Round(time.Millisecond); r > 0 {
 		parts = append(parts, fmt.Sprintf("state_sync_recovery=%s", r))
@@ -767,6 +771,122 @@ func refreshConfiguredNamedStartCandidate(
 	return candidate
 }
 
+// perDispatchModelSourceKey records, on a session bead, the routing model that
+// maybeApplyPerDispatchModelOverride auto-stamped into template_overrides. Its
+// presence distinguishes an auto-stamped model (which a later dispatch may
+// switch or clear) from a genuine operator/dashboard override (which routing
+// metadata must never touch). An empty/absent value means "not auto-stamped".
+const perDispatchModelSourceKey = "gc.per_dispatch_model"
+
+// maybeApplyPerDispatchModelOverride reconciles the per-dispatch model requested
+// by a candidate session's assigned work bead (its advisory "gc.model" metadata)
+// with the session's own template_overrides, so the existing override pipeline
+// turns it into a --model flag at launch. Because sessions go asleep and
+// re-spawn to claim new work, this runs on every start and must be able to
+// switch or clear a model it previously stamped, not only stamp it once.
+//
+// Precedence, given the parsed template_overrides ("existing"), the prior
+// provenance marker ("prev", see perDispatchModelSourceKey), and the model
+// advised by the current work bead ("model"):
+//   - the resolved provider must expose a "model" option in its schema, else
+//     this is a no-op;
+//   - an explicit operator/dashboard model (existing["model"] set with no
+//     provenance marker) always wins — routing metadata never overrides it;
+//   - a previously auto-stamped model is re-resolved: a new valid model
+//     replaces it, an absent model clears it (falling back to the agent's
+//     configured default), and an invalid model leaves the prior value in
+//     place;
+//   - with nothing stamped yet, a valid advised model is stamped.
+//
+// An unknown/invalid gc.model value is logged and ignored rather than failing
+// the start, so an advisory value the running provider doesn't recognize never
+// blocks a session from launching. The override and its provenance are
+// persisted on the session bead (not just applied in memory) so config-drift
+// hashing via sessionCoreConfigForHash and the launch command stay consistent.
+func maybeApplyPerDispatchModelOverride(candidate startCandidate, cfg *config.City, store beads.Store) {
+	session := candidate.session
+	if store == nil || session == nil || session.ID == "" {
+		return
+	}
+	tp := candidate.tp
+	if tp.ResolvedProvider == nil || len(tp.ResolvedProvider.OptionsSchema) == 0 {
+		return
+	}
+	existing, err := sessionpkg.ParseTemplateOverrides(session.Metadata)
+	if err != nil {
+		// A malformed template_overrides blob is repaired by the existing
+		// override pipeline; don't compound it here.
+		return
+	}
+	_, hasModel := existing["model"]
+	prev := strings.TrimSpace(session.Metadata[perDispatchModelSourceKey])
+
+	// A genuine operator/dashboard override carries no auto-stamp provenance
+	// and always wins over routing metadata.
+	if hasModel && prev == "" {
+		return
+	}
+
+	model := resolveTaskModel(store, taskWorkDirAssignees(candidate, cfg)...)
+
+	// Work on a private copy so a marshal/persist failure never mutates the
+	// session's in-memory overrides.
+	overrides := make(map[string]string, len(existing))
+	for k, v := range existing {
+		overrides[k] = v
+	}
+
+	if model == "" {
+		// Nothing advised this dispatch. Clear a prior auto-stamp so the agent
+		// falls back to its configured default; otherwise there is nothing to do.
+		if prev == "" {
+			return
+		}
+		delete(overrides, "model")
+		if err := persistPerDispatchModelOverride(session, store, overrides, ""); err != nil {
+			log.Printf("session %s: clearing per-dispatch model override: %v", session.ID, err)
+		}
+		return
+	}
+
+	// Validate against the resolved provider's schema before persisting. An
+	// invalid value would otherwise surface only as a template_overrides
+	// resolution error at launch, so log and ignore it, leaving any prior
+	// auto-stamped model in place.
+	if _, err := config.ResolveExplicitOptions(tp.ResolvedProvider.OptionsSchema, map[string]string{"model": model}); err != nil {
+		log.Printf("session %s: ignoring work bead gc.model=%q: %v", session.ID, model, err)
+		return
+	}
+	overrides["model"] = model
+	if err := persistPerDispatchModelOverride(session, store, overrides, model); err != nil {
+		log.Printf("session %s: persisting per-dispatch model override: %v", session.ID, err)
+	}
+}
+
+// persistPerDispatchModelOverride writes the session's template_overrides blob
+// and the per-dispatch provenance marker together, then mirrors both into the
+// in-memory session bead so the in-flight start and config-drift hashing stay
+// consistent with what was persisted. A source of "" clears the provenance
+// marker, recording that no model is currently auto-stamped.
+func persistPerDispatchModelOverride(session *beads.Bead, store beads.Store, overrides map[string]string, source string) error {
+	raw, err := json.Marshal(overrides)
+	if err != nil {
+		return err
+	}
+	if err := store.SetMetadataBatch(session.ID, map[string]string{
+		"template_overrides":      string(raw),
+		perDispatchModelSourceKey: source,
+	}); err != nil {
+		return err
+	}
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string, 2)
+	}
+	session.Metadata["template_overrides"] = string(raw)
+	session.Metadata[perDispatchModelSourceKey] = source
+	return nil
+}
+
 func buildPreparedStart(
 	candidate startCandidate,
 	cfg *config.City,
@@ -785,12 +905,26 @@ func buildPreparedStartWithWorkDirResolver(
 	tp := candidate.tp
 	agentCfg := templateParamsToConfig(tp)
 
+	// Per-dispatch model: fold a work bead's advisory "gc.model" metadata into
+	// this session's template_overrides before they are applied below. The
+	// model-advisor pack and the mol-review-quorum formula already write
+	// gc.model on work beads; persisting it as a per-session override here is
+	// what makes an advised model take effect per task/shape instead of only
+	// per agent. An explicit per-session model override always wins, so an
+	// operator/dashboard choice is never overridden by routing metadata, and
+	// the session bead remains the single source of truth so config-drift
+	// hashing (sessionCoreConfigForHash) stays consistent with the launch
+	// command. Default behavior is unchanged when no work bead carries
+	// gc.model.
+	maybeApplyPerDispatchModelOverride(candidate, cfg, store)
+
 	// Fold a per-dispatch reasoning effort from the session's assigned work
 	// bead (gc.reasoning metadata) into template_overrides["effort"], mirroring
 	// how schema option overrides are carried. Only providers with an "effort"
 	// option (codex) consume it; for codex this becomes
 	// `-c model_reasoning_effort=<effort>` via the existing resolution below.
 	// An explicit session-level effort override wins over the dispatch default.
+	// This knob is independent of the per-dispatch model above; both run here.
 	applyDispatchReasoningOverride(candidate, cfg, store)
 
 	// Apply template_overrides from bead metadata. These are per-session
@@ -1120,7 +1254,7 @@ func runPreparedStartCandidate(
 	defer cancel()
 	var phases startPhaseTimings
 	startCallBegin := time.Now()
-	startedFresh, err := startPreparedStartCandidate(startCtx, item, cityPath, store, sp, cfg)
+	startedFresh, err := startPreparedStartCandidate(startCtx, item, cityPath, store, sp, cfg, &phases)
 	startCtxErr := startCtx.Err()
 	// Split start_call into provider.Start and the ErrStateSync recovery
 	// branch (gc-9ha). The recovery branch hits the worker observation
@@ -1549,18 +1683,37 @@ func startPreparedStartCandidate(
 	store beads.Store,
 	sp runtime.Provider,
 	cfg *config.City,
+	phases *startPhaseTimings,
 ) (bool, error) {
 	name := item.candidate.name()
 	if sp != nil {
 		running, alive := observeRuntimeProviderLiveness(sp, name, item.cfg.ProcessNames)
 		if running {
-			if shouldRollbackPendingCreate(item.candidate.session) && !runningSessionMatchesPendingCreate(item.candidate.session, name, sp) {
-				return false, fmt.Errorf("%w: session %q", runtime.ErrSessionExists, name)
-			}
 			if alive {
+				if shouldRollbackPendingCreate(item.candidate.session) && !runningSessionMatchesPendingCreate(item.candidate.session, name, sp) {
+					return false, fmt.Errorf("%w: session %q", runtime.ErrSessionExists, name)
+				}
 				return false, nil
 			}
-			return false, fmt.Errorf("session %q died during startup", name)
+			// Zombie: the runtime container (e.g. tmux pane) is up but the
+			// agent process is gone — typically a session that survived a
+			// supervisor restart and whose CLI exited back to the wrapping
+			// shell. Failing here wedges the reconciler in a collide-loop:
+			// the stale session keeps the name occupied, every retry hits
+			// the same state, and templates depending on this session never
+			// start (ga-yms). A dead agent process has nothing left to
+			// preserve — identity mismatch included, since rolling a pending
+			// create back just recreates the bead next tick against the same
+			// zombie — so recycle it: stop the stale session and fall
+			// through to a fresh start.
+			recycleBegin := time.Now()
+			stopErr := sp.Stop(name)
+			if phases != nil {
+				phases.ZombieRecycle = time.Since(recycleBegin)
+			}
+			if stopErr != nil && !runtime.IsSessionGone(stopErr) {
+				return false, fmt.Errorf("recycling session %q with dead agent process: %w", name, stopErr)
+			}
 		}
 	}
 	if store == nil || item.candidate.session == nil || strings.TrimSpace(item.candidate.session.ID) == "" {
