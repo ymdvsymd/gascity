@@ -107,10 +107,15 @@ func liveListQuery(query ListQuery) ListQuery {
 // from the in-memory cache when it is live and clean; everything else
 // (Live queries, ParentID lookups, closed history, dirty/unprimed cache)
 // delegates to the backing store's Counter. Backing stores without a
-// Counter return ErrCountUnsupported so callers can fall back to List.
+// Counter return ErrCountUnsupported so callers can fall back to List. Limited
+// queries are unsupported because Count must match List cardinality, including
+// List's post-sort limit cap.
 func (c *CachingStore) Count(ctx context.Context, query ListQuery, excludeTypes ...string) (int, error) {
 	if !query.HasFilter() && !query.AllowScan {
 		return 0, fmt.Errorf("counting beads: %w", ErrQueryRequiresScan)
+	}
+	if query.Limit > 0 {
+		return 0, fmt.Errorf("counting beads: %w", ErrCountUnsupported)
 	}
 	if !query.Live && query.ParentID == "" && !query.IncludesClosed() {
 		c.mu.RLock()
@@ -473,7 +478,7 @@ func (c *CachingStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 
 		var result []Bead
 		for _, b := range openBeads {
-			if cachedBeadReady(statusByID, depsByID[b.ID]) {
+			if cachedBeadReady(b, statusByID, depsByID[b.ID]) {
 				result = append(result, cloneBead(b))
 			}
 		}
@@ -521,7 +526,7 @@ func (c *CachingStore) CachedReady() ([]Bead, bool) {
 		default:
 			return nil, false
 		}
-		if cachedBeadReady(statusByID, deps) {
+		if cachedBeadReady(b, statusByID, deps) {
 			result = append(result, cloneBead(b))
 		}
 	}
@@ -531,7 +536,10 @@ func (c *CachingStore) CachedReady() ([]Bead, bool) {
 	return result, true
 }
 
-func cachedBeadReady(statusByID map[string]string, deps []Dep) bool {
+func cachedBeadReady(b Bead, statusByID map[string]string, deps []Dep) bool {
+	if b.IsBlocked != nil {
+		return !*b.IsBlocked
+	}
 	for _, dep := range deps {
 		if !isReadyBlockingDependencyType(dep.Type) {
 			continue

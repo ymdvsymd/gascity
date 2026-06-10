@@ -2065,6 +2065,7 @@ export interface components {
         };
         AgentPatch: {
             AppendFragments: string[] | null;
+            Args: string[] | null;
             Attach: boolean | null;
             DefaultSlingFormula: string | null;
             DependsOn: string[] | null;
@@ -2229,6 +2230,7 @@ export interface components {
             ephemeral?: boolean;
             from?: string;
             id: string;
+            is_blocked?: boolean;
             issue_type: string;
             labels?: string[] | null;
             metadata?: {
