@@ -453,11 +453,7 @@ func TestFindCity(t *testing.T) {
 	t.Run("not_found", func(t *testing.T) {
 		// Use an explicit /tmp-rooted dir so the upward walk cannot
 		// accidentally hit a real .gc/ directory on the host (e.g.
-		// a running city under $HOME). Skip when /tmp/.gc already
-		// exists (running city in /tmp would make findCity succeed).
-		if _, err := os.Stat("/tmp/.gc"); err == nil {
-			t.Skip("machine has /tmp/.gc — running city in /tmp would cause a false positive")
-		}
+		// a running city under $HOME).
 		dir, err := os.MkdirTemp("/tmp", "gc-test-notfound-*")
 		if err != nil {
 			t.Fatal(err)
@@ -2753,10 +2749,12 @@ func TestDoInitWritesExpectedTOML(t *testing.T) {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
 
-	// city.toml keeps only the runtime-local [workspace] (empty in the
-	// default mayor-only path). workspace.name lives in .gc/site.toml.
+	// city.toml keeps the runtime-local [workspace] with the explicit
+	// builtin pack includes (core + bd for the default bd provider).
+	// workspace.name lives in .gc/site.toml.
 	got := string(f.Files[filepath.Join("/bright-lights", "city.toml")])
 	want := `[workspace]
+includes = [".gc/system/packs/core", ".gc/system/packs/bd"]
 
 [daemon]
 formula_v2 = true
@@ -3460,8 +3458,10 @@ func TestDoInitWithGastownTemplate(t *testing.T) {
 	if cfg.Workspace.Provider != "claude" {
 		t.Errorf("Workspace.Provider = %q, want %q", cfg.Workspace.Provider, "claude")
 	}
-	if len(cfg.Workspace.LegacyIncludes()) != 0 {
-		t.Errorf("Workspace.Includes = %v, want empty", cfg.Workspace.LegacyIncludes())
+	wantIncludes := []string{".gc/system/packs/core", ".gc/system/packs/bd"}
+	if got := cfg.Workspace.LegacyIncludes(); len(got) != len(wantIncludes) ||
+		got[0] != wantIncludes[0] || got[1] != wantIncludes[1] {
+		t.Errorf("Workspace.Includes = %v, want %v (explicit builtin pack includes)", got, wantIncludes)
 	}
 	if len(cfg.Workspace.LegacyDefaultRigIncludes()) != 0 {
 		t.Errorf("Workspace.DefaultRigIncludes = %v, want empty", cfg.Workspace.LegacyDefaultRigIncludes())
@@ -3922,9 +3922,11 @@ scale_check = "echo 3"
 	if cfg.ResolvedWorkspaceName != "bright-lights" {
 		t.Errorf("ResolvedWorkspaceName = %q, want %q (should be overridden)", cfg.ResolvedWorkspaceName, "bright-lights")
 	}
+	// The builtin core pack ships no agents (the former maintenance
+	// fallback dog is gone), so only the two authored agents are explicit.
 	explicit := explicitAgents(cfg.Agents)
-	if len(explicit) != 3 {
-		t.Fatalf("len(explicitAgents) = %d, want 3", len(explicit))
+	if len(explicit) != 2 {
+		t.Fatalf("len(explicitAgents) = %d, want 2", len(explicit))
 	}
 	explicitByName := make(map[string]config.Agent, len(explicit))
 	for _, agent := range explicit {
@@ -3938,10 +3940,6 @@ scale_check = "echo 3"
 	if !ok {
 		t.Fatalf("explicitAgents missing worker: %+v", explicit)
 	}
-	dog, ok := explicitByName["dog"]
-	if !ok {
-		t.Fatalf("explicitAgents missing builtin maintenance dog agent: %+v", explicit)
-	}
 	if worker.MaxActiveSessions == nil {
 		t.Fatal("worker.MaxActiveSessions is nil, want non-nil")
 	}
@@ -3950,9 +3948,6 @@ scale_check = "echo 3"
 	}
 	if !strings.HasSuffix(mayor.PromptTemplate, filepath.Join("agents", "mayor", "prompt.template.md")) {
 		t.Errorf("mayor.PromptTemplate = %q, want suffix %q", mayor.PromptTemplate, filepath.Join("agents", "mayor", "prompt.template.md"))
-	}
-	if !strings.HasSuffix(dog.PromptTemplate, filepath.Join(".gc", "system", "packs", "maintenance", "agents", "dog", "prompt.template.md")) {
-		t.Errorf("dog.PromptTemplate = %q, want maintenance dog prompt", dog.PromptTemplate)
 	}
 
 	packData, err := os.ReadFile(filepath.Join(cityPath, "pack.toml"))
