@@ -14,10 +14,12 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agentutil"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
@@ -629,7 +631,7 @@ func (r cliBeadRouter) Route(_ context.Context, req sling.RouteRequest) error {
 	if r.deps.Cfg != nil {
 		routedTo = agentutil.NormalizePoolRouteTarget(r.deps.Cfg, req.Target)
 	}
-	if err := r.deps.Store.SetMetadata(req.BeadID, "gc.routed_to", routedTo); err != nil {
+	if err := r.deps.Store.SetMetadata(req.BeadID, beadmeta.RoutedToMetadataKey, routedTo); err != nil {
 		return fmt.Errorf("setting gc.routed_to on %s: %w", req.BeadID, err)
 	}
 	return nil
@@ -1191,28 +1193,28 @@ func decorateGraphWorkflowRecipe(recipe *formula.Recipe, routeVars map[string]st
 			// gc.routed_to (the sole canonical key the worker claim path reads)
 			// so a pool-routed root is claimable rather than idle-reaped
 			// (fixes #2763; gc.run_target retired as a wire field — ga-eld2x).
-			step.Metadata["gc.routed_to"] = routedTo
-			delete(step.Metadata, "gc.run_target")
+			step.Metadata[beadmeta.RoutedToMetadataKey] = routedTo
+			delete(step.Metadata, beadmeta.RunTargetMetadataKey)
 			if sessionName != "" {
 				// Mirror graphroute's root #2843 session stamp so this CLI-local
 				// decorator stays in sync. Non-root steps already delegate to
-				// graphroute via assignGraphStepRoute.
-				step.Metadata["gc.session_name"] = sessionName
+				// graphroute.AssignGraphStepRoute.
+				step.Metadata[beadmeta.SessionNameMetadataKey] = sessionName
 			}
 			continue
 		}
-		if sling.IsWorkflowTopologyKind(step.Metadata["gc.kind"]) {
+		if graphroute.IsWorkflowTopologyKind(step.Metadata[beadmeta.KindMetadataKey]) {
 			continue
 		}
 		binding, err := resolveGraphStepBindingWithVars(step.ID, stepByID, stepAlias, depsByStep, bindingCache, resolving, routeVars, defaultRoute, routingRigContext, store, cityName, cityPath, cfg)
 		if err != nil {
 			return err
 		}
-		if isControlDispatcherKind(step.Metadata["gc.kind"]) {
-			assignGraphStepRoute(step, binding, &controlRoute)
+		if graphroute.IsControlDispatcherKind(step.Metadata[beadmeta.KindMetadataKey]) {
+			graphroute.AssignGraphStepRoute(step, binding, &controlRoute)
 			continue
 		}
-		assignGraphStepRoute(step, binding, nil)
+		graphroute.AssignGraphStepRoute(step, binding, nil)
 	}
 	return nil
 }
@@ -1242,8 +1244,8 @@ func workflowStoreRefForDir(storeDir, cityPath, cityName string, cfg *config.Cit
 	return ""
 }
 
-// graphRouteBinding is an alias for sling.GraphRouteBinding.
-type graphRouteBinding = sling.GraphRouteBinding
+// graphRouteBinding is an alias for graphroute.GraphRouteBinding.
+type graphRouteBinding = graphroute.GraphRouteBinding
 
 type graphStepTarget struct {
 	value        string
@@ -1273,9 +1275,9 @@ func resolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 
 	target := graphStepRouteTarget(step, routeVars)
 	if target.value == "" {
-		switch step.Metadata["gc.kind"] {
+		switch step.Metadata[beadmeta.KindMetadataKey] {
 		case "scope-check":
-			controlTarget := strings.TrimSpace(step.Metadata["gc.control_for"])
+			controlTarget := strings.TrimSpace(step.Metadata[beadmeta.ControlForMetadataKey])
 			if controlTarget != "" {
 				binding, err := resolveGraphStepBindingWithVars(controlTarget, stepByID, stepAlias, depsByStep, cache, resolving, routeVars, fallback, rigContext, store, cityName, cityPath, cfg)
 				if err != nil {
@@ -1285,7 +1287,7 @@ func resolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 				return binding, nil
 			}
 		case "fanout":
-			controlTarget := strings.TrimSpace(step.Metadata["gc.control_for"])
+			controlTarget := strings.TrimSpace(step.Metadata[beadmeta.ControlForMetadataKey])
 			if controlTarget != "" {
 				binding, err := resolveGraphStepBindingWithVars(controlTarget, stepByID, stepAlias, depsByStep, cache, resolving, routeVars, fallback, rigContext, store, cityName, cityPath, cfg)
 				if err != nil {
@@ -1304,7 +1306,7 @@ func resolveGraphStepBindingWithVars(stepID string, stepByID map[string]*formula
 				if depStep == nil {
 					continue
 				}
-				switch depStep.Metadata["gc.kind"] {
+				switch depStep.Metadata[beadmeta.KindMetadataKey] {
 				case "retry-run", "run":
 					subjectID = depID
 				}
@@ -1396,7 +1398,7 @@ func graphStepRouteTarget(step *formula.RecipeStep, routeVars map[string]string)
 	if step.Metadata == nil {
 		return graphStepTarget{}
 	}
-	return graphStepTarget{value: strings.TrimSpace(formula.Substitute(step.Metadata["gc.run_target"], routeVars))}
+	return graphStepTarget{value: strings.TrimSpace(formula.Substitute(step.Metadata[beadmeta.RunTargetMetadataKey], routeVars))}
 }
 
 func resolveGraphDirectSessionBinding(store beads.Store, cityName, cityPath string, cfg *config.City, target, rigContext string) (graphRouteBinding, bool, error) {

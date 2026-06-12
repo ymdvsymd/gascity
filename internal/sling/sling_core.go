@@ -9,10 +9,12 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agentutil"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
@@ -630,7 +632,7 @@ func doStartGraphWorkflow(rootID, sourceBeadID string, a config.Agent, method st
 		return result, fmt.Errorf("setting workflow root %s in_progress: %w", rootID, err)
 	}
 	if sourceBeadID != "" {
-		if err := deps.Store.SetMetadata(rootID, "gc.source_bead_id", sourceBeadID); err != nil {
+		if err := deps.Store.SetMetadata(rootID, beadmeta.SourceBeadIDMetadataKey, sourceBeadID); err != nil {
 			return result, fmt.Errorf("setting gc.source_bead_id on workflow %s: %w", rootID, err)
 		}
 		if sourceStoreRef := strings.TrimSpace(deps.StoreRef); sourceStoreRef != "" {
@@ -1107,7 +1109,7 @@ func isGraphSlingFormula(ctx context.Context, formulaName string, searchPaths []
 	if err != nil {
 		return false, err
 	}
-	return IsCompiledGraphWorkflow(recipe), nil
+	return graphroute.IsCompiledGraphWorkflow(recipe), nil
 }
 
 func prepareGraphV2FormulaInvocation(ctx context.Context, formulaName, targetID string, opts SlingOpts, deps SlingDeps, a config.Agent) (graphv2.Invocation, bool, error) {
