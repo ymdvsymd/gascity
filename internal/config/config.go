@@ -1166,8 +1166,8 @@ type Workspace struct {
 	// InstallAgentHooks lists provider names whose hooks should be installed
 	// into agent working directories. Agent-level overrides workspace-level
 	// (replace, not additive). Supported: "claude", "codex", "gemini",
-	// "antigravity", "kiro", "opencode", "groq", "cerebras", "copilot",
-	// "cursor", "pi", "omp", "kimi".
+	// "antigravity", "kiro", "opencode", "mimocode", "groq", "cerebras",
+	// "copilot", "cursor", "pi", "omp", "kimi".
 	InstallAgentHooks []string `toml:"install_agent_hooks,omitempty"`
 	// GlobalFragments lists named template fragments injected into every
 	// agent's rendered prompt. Applied before per-agent InjectFragments.
@@ -1730,9 +1730,10 @@ type DoltConfig struct {
 	// 0 means use the managed default.
 	WriteTimeoutMillis int `toml:"write_timeout_millis,omitempty" jsonschema:"default=300000"`
 	// DoltLockReleaseTimeout is how long managed-dolt lifecycle operations
-	// wait for dolt's on-disk exclusive store lock
-	// (`<data_dir>/<db>/.dolt/noms/LOCK`) to be released by a prior server
-	// process before failing closed. The start path refuses to launch a
+	// wait for dolt's on-disk exclusive store locks (the root-level
+	// `<data_dir>/.dolt/noms/LOCK` and per-database
+	// `<data_dir>/<db>/.dolt/noms/LOCK` forms) to be released by a prior
+	// server process before failing closed. The start path refuses to launch a
 	// second `dolt sql-server` against a data_dir whose lock is still held —
 	// a prior instance that is shutting down holds the lock until its chunk
 	// journal is flushed, and binding before release corrupts the journal
@@ -1741,7 +1742,10 @@ type DoltConfig struct {
 	// Duration string (e.g., "1m", "90s"). Defaults to "1m", which covers
 	// the flush window of multi-GB journals on commodity SSDs. Set to "0s"
 	// to probe once with no wait (still fail-closed when held). Negative
-	// values are rejected at config load.
+	// values are rejected at config load. The managed lifecycle also
+	// projects this value into the gc-beads-bd.sh shell fallback as
+	// GC_DOLT_LOCK_RELEASE_TIMEOUT_MS (milliseconds), so both paths honor
+	// the configured window.
 	DoltLockReleaseTimeout string `toml:"dolt_lock_release_timeout,omitempty" jsonschema:"default=1m"`
 }
 
@@ -4598,7 +4602,7 @@ func DefaultCity(name string) City {
 
 func defaultInstallAgentHooksForProvider(provider string) []string {
 	switch strings.TrimSpace(provider) {
-	case "kiro", "opencode", "groq", "kimi":
+	case "kiro", "opencode", "mimocode", "groq", "kimi":
 		return []string{strings.TrimSpace(provider)}
 	default:
 		return nil
