@@ -83,7 +83,7 @@
             "type": "string"
           },
           "type": "array",
-          "description": "PreStart is a list of shell commands run before session creation.\nCommands run on the target filesystem: locally for tmux, inside the\npod/container for exec providers. Template variables same as session_setup."
+          "description": "PreStart is a list of shell commands run before session creation.\nCommands run on the target filesystem: locally for tmux, inside the\npod/container for exec providers. Template variables same as session_setup.\nOn failure, the last 4 KiB of the command's stdout/stderr is included\nin the error and may appear in controller and reconciler logs; avoid\nset -x or echoing secrets in setup commands."
         },
         "prompt_template": {
           "type": "string",
@@ -253,18 +253,18 @@
             "type": "string"
           },
           "type": "array",
-          "description": "SessionSetup is a list of shell commands run after session creation.\nEach command is a template string supporting placeholders:\n{{.Session}}, {{.Agent}}, {{.AgentBase}}, {{.Rig}}, {{.RigRoot}},\n{{.CityRoot}}, {{.CityName}}, {{.WorkDir}}.\nCommands run in gc's process (not inside the agent session) via sh -c."
+          "description": "SessionSetup is a list of shell commands run after session creation.\nEach command is a template string supporting placeholders:\n{{.Session}}, {{.Agent}}, {{.AgentBase}}, {{.Rig}}, {{.RigRoot}},\n{{.CityRoot}}, {{.CityName}}, {{.WorkDir}}.\nCommands run in gc's process (not inside the agent session) via sh -c.\nOn failure, the last 4 KiB of the command's stdout/stderr is included\nin the error and may appear in controller and reconciler logs; avoid\nset -x or echoing secrets in setup commands."
         },
         "session_setup_script": {
           "type": "string",
-          "description": "SessionSetupScript is the path to a script run after session_setup commands.\nRelative paths resolve against the declaring config file's directory\n(pack-safe). Paths prefixed with \"//\" resolve against the city root.\nThe script receives context via environment variables (GC_SESSION plus\nexisting GC_* vars)."
+          "description": "SessionSetupScript is the path to a script run after session_setup commands.\nRelative paths resolve against the declaring config file's directory\n(pack-safe). Paths prefixed with \"//\" resolve against the city root.\nThe script receives context via environment variables (GC_SESSION plus\nexisting GC_* vars). On failure, the last 4 KiB of the script's\nstdout/stderr is included in the error and may appear in controller\nand reconciler logs; avoid set -x or echoing secrets in setup scripts."
         },
         "session_live": {
           "items": {
             "type": "string"
           },
           "type": "array",
-          "description": "SessionLive is a list of shell commands that are safe to re-apply\nwithout restarting the agent. Run at startup (after session_setup)\nand re-applied on config change without triggering a restart.\nMust be idempotent. Typical use: tmux theming, keybindings, status bars.\nSame template placeholders as session_setup."
+          "description": "SessionLive is a list of shell commands that are safe to re-apply\nwithout restarting the agent. Run at startup (after session_setup)\nand re-applied on config change without triggering a restart.\nMust be idempotent. Typical use: tmux theming, keybindings, status bars.\nSame template placeholders as session_setup.\nOn failure, the last 4 KiB of the command's stdout/stderr is included\nin the error and may appear in controller and reconciler logs; avoid\nset -x or echoing secrets in setup commands."
         },
         "overlay_dir": {
           "type": "string",
@@ -961,7 +961,7 @@
         },
         "delete_after_close": {
           "type": "string",
-          "description": "DeleteAfterClose deletes matching GC-owned beads after they have been\nclosed for this duration. Accepts Go duration syntax plus whole-day \"d\"\nunits, e.g. \"7d\" or \"1d12h\". Empty defers to any controller-managed\ndefault for the policy type (e.g. order_tracking defaults to 7d)."
+          "description": "DeleteAfterClose deletes matching GC-owned beads after they have been\nclosed for this duration. Accepts Go duration syntax plus whole-day \"d\"\nunits, e.g. \"7d\" or \"1d12h\". ApplyBeadPolicyDefaults fills in a\nnon-empty default for recognized policy types (order_tracking: \"7d\"),\nso this field is populated after config load even when the city.toml\nomits it."
         }
       },
       "additionalProperties": false,
@@ -1044,7 +1044,7 @@
             "$ref": "#/$defs/Import"
           },
           "type": "object",
-          "description": "Imports defines named pack imports (V2 mechanism). Each key is a\nbinding name; the value specifies the source and optional version,\nexport, and transitive controls. Processed during ExpandCityPacks."
+          "description": "Imports defines named pack imports. Each key is a local\nbinding name; the authored public contract stores a durable source plus\noptional version. Processed during ExpandCityPacks."
         },
         "defaults": {
           "$ref": "#/$defs/PackDefaults",
@@ -1055,7 +1055,7 @@
             "$ref": "#/$defs/Agent"
           },
           "type": "array",
-          "description": "Agents lists all configured agents in this city. Optional: PackV2\ncities compose agents through [imports.*] and ship without any\n[[agent]] block."
+          "description": "Agents lists all configured agents in this city. Pack-composed cities can\ncompose agents through [imports.*] and ship without any\n[[agent]] block."
         },
         "named_session": {
           "items": {
@@ -1097,7 +1097,7 @@
         },
         "formulas": {
           "$ref": "#/$defs/FormulasConfig",
-          "description": "Formulas configures formula directory settings."
+          "description": "Formulas is the legacy [formulas] table; authored [formulas].dir is\nrejected at config load. Formulas live in the well-known formulas/\ndirectory."
         },
         "daemon": {
           "$ref": "#/$defs/DaemonConfig",
@@ -1105,7 +1105,7 @@
         },
         "orders": {
           "$ref": "#/$defs/OrdersConfig",
-          "description": "Orders configures order settings (skip list)."
+          "description": "Orders configures order settings: skip list, max_timeout cap, and\nper-order overrides."
         },
         "api": {
           "$ref": "#/$defs/APIConfig",
@@ -1351,6 +1351,11 @@
           "description": "ArchiveLevel controls Dolt's auto_gc archive aggressiveness.\n0 disables archive compaction (lower CPU on startup).\n1 enables archive compaction (higher CPU on startup).\nnil (omitted) defaults to 0.",
           "default": 0
         },
+        "auto_gc_enabled": {
+          "type": "boolean",
+          "description": "AutoGCEnabled toggles Dolt's incremental auto-GC on the managed\nsql-server. Auto-GC bounds the noms journal so it never reaches\nGB scale, which shrinks both the unclean-stop corruption window\nand the recovery blast radius. nil (omitted) defaults to true.",
+          "default": true
+        },
         "max_connections": {
           "type": "integer",
           "description": "MaxConnections overrides the managed Dolt listener max_connections.\n0 means use the managed default.",
@@ -1451,7 +1456,7 @@
       "properties": {},
       "additionalProperties": false,
       "type": "object",
-      "description": "FormulasConfig holds legacy formula directory settings."
+      "description": "FormulasConfig is the legacy [formulas] table with no supported fields: authored [formulas].dir is rejected at config load (use the well-known formulas/ directory instead), and gc doctor flags any declaration as a fixable v2-formulas-dir error."
     },
     "GitHubConfig": {
       "properties": {
@@ -1618,22 +1623,6 @@
         "version": {
           "type": "string",
           "description": "Version is an optional semver constraint for git-backed imports (e.g.,\n\"^1.2\"). Empty for local paths. \"sha:\u003chex\u003e\" pins a specific commit."
-        },
-        "export": {
-          "type": "boolean",
-          "description": "Export re-exports this import's contents into the parent pack's\nnamespace. Consumers of the parent get this import's agents\nflattened under the parent's binding name."
-        },
-        "transitive": {
-          "type": "boolean",
-          "description": "Transitive controls whether this import's own imports are visible\nto the consumer. Defaults to true (transitive). Set to false to\nsuppress transitive resolution for this specific import."
-        },
-        "shadow": {
-          "type": "string",
-          "enum": [
-            "warn",
-            "silent"
-          ],
-          "description": "Shadow controls shadow warnings when the importer defines an agent\nwith the same name as one from this import. \"warn\" (default) emits\na warning; \"silent\" suppresses it."
         }
       },
       "additionalProperties": false,
@@ -1777,7 +1766,7 @@
         },
         "template": {
           "type": "string",
-          "description": "Template is the referenced agent template name. Root declarations may\ntarget imported PackV2 agents via \"binding.agent\"."
+          "description": "Template is the referenced agent template name. Root declarations may\ntarget imported agents via \"binding.agent\"."
         },
         "scope": {
           "type": "string",
@@ -1958,7 +1947,7 @@
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "OrdersConfig holds order settings."
+      "description": "OrdersConfig holds order settings for orders discovered from flat TOML files (one file per order) in the orders/ directory beside each formula layer (packs, the city directory, and rig-local layers)."
     },
     "PackDefaults": {
       "properties": {
@@ -2375,7 +2364,7 @@
         },
         "formulas_dir": {
           "type": "string",
-          "description": "FormulasDir is a rig-local formula directory (Layer 4). Overrides\npack formulas for this rig by filename.\nRelative paths resolve against the city directory."
+          "description": "FormulasDir is a rig-local formula directory — the highest-priority\nformula layer, above city pack formulas, the city formulas/\ndirectory, and rig pack formulas. Overrides pack formulas for this\nrig by filename.\nRelative paths resolve against the city directory."
         },
         "includes": {
           "items": {
@@ -2766,5 +2755,5 @@
     }
   },
   "title": "Gas City Configuration",
-  "description": "Schema for city.toml — the PackV2 deployment file for a Gas City instance. Pack definitions live in pack.toml and conventional pack directories such as agents/, formulas/, orders/, and commands/. Use [imports.*] for PackV2 composition; legacy includes and [[agent]] fields remain visible for migration compatibility. Legacy [packs.*] entries are still accepted by the runtime for migration/fetch compatibility but are intentionally omitted from this public schema.\n\n\u003e **PackV2 format source of truth:** The public PackV2 format and loader semantics are specified in [Gas City Pack Specification (2.0)](/specs/pack-spec)."
+  "description": "Schema for city.toml — the deployment file for a Gas City instance. Pack definitions live in pack.toml and conventional pack directories such as agents/, formulas/, orders/, and commands/. Use [imports.*] for pack composition; legacy includes and [[agent]] fields remain visible for migration compatibility. Legacy [packs.*] entries are still accepted by the runtime for migration/fetch compatibility but are intentionally omitted from this public schema.\n\n\u003e **Pack format source of truth:** Public pack format and loader semantics are specified in [Gas City Pack Specification](/reference/specs/pack-spec)."
 }

@@ -41,7 +41,6 @@ const (
 	orderTrackingSweepOrder                = "order-tracking-sweep"
 	orderTrackingBeadPolicyName            = "order_tracking"
 	defaultOrderTrackingSweepStaleAfter    = 10 * time.Minute
-	defaultOrderTrackingDeleteAfterClose   = 7 * 24 * time.Hour
 	minClosedOrderTrackingRetained         = 10
 	legacyOrderTrackingRetentionBucket     = "\x00legacy-unscoped-order-tracking"
 	orderTrackingSweepWatchdogInterval     = 30 * time.Second
@@ -86,6 +85,12 @@ const (
 	// closed order-tracking beads deleted per watchdog invocation.
 	orderTrackingRetentionWatchdogDeleteBudget = 100
 )
+
+// defaultOrderTrackingDeleteAfterClose is derived from the canonical config
+// constant so both load-time defaults and the runtime fallback stay in sync.
+var defaultOrderTrackingDeleteAfterClose = config.BeadPolicyConfig{
+	DeleteAfterClose: config.DefaultOrderTrackingDeleteAfterClose,
+}.DeleteAfterCloseDuration()
 
 var (
 	// shellExecPostCancelWaitDelay is os/exec's pipe-close wait after
@@ -1233,7 +1238,7 @@ func poolOrderRouteVisibilityWarning(a orders.Order, recipe *formula.Recipe) str
 	if strings.TrimSpace(a.Pool) == "" || formula.RecipeHasReadySurface(recipe) {
 		return ""
 	}
-	return fmt.Sprintf("warning: pool order %q uses formula %q whose root is a molecule container, not Ready-visible work; scale-from-zero pools will not wake for this wisp. Convert the formula to phase=\"vapor\"/root-only or graph.v2 before routing it to a pool.", a.ScopedName(), a.Formula)
+	return fmt.Sprintf("warning: pool order %q uses formula %q whose root is a molecule container, not Ready-visible work; scale-from-zero pools will not wake for this wisp. Convert the formula to phase=\"vapor\"/root-only or formulas v2 before routing it to a pool.", a.ScopedName(), a.Formula)
 }
 
 func redactOrderEnvError(err error, env []string) string {

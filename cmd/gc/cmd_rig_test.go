@@ -3306,3 +3306,23 @@ func TestRouteRigList_StaleBannerOver30s(t *testing.T) {
 		t.Errorf("stale banner missing from human output:\n%s", stdout.String())
 	}
 }
+
+// Regression test for the ga-lurp5d follow-up: a failed rig add must roll
+// back a symlinked city.toml by restoring the link target, not by replacing
+// the link with a regular file.
+func TestRigAddRollbackRestoresThroughCityTomlSymlink(t *testing.T) {
+	fs := fsys.OSFS{}
+	cityDir, link, target := setupSymlinkedCityToml(t)
+
+	snapshots, err := snapshotRigAddTopologyFiles(fs, cityDir, &config.City{})
+	if err != nil {
+		t.Fatalf("snapshotRigAddTopologyFiles: %v", err)
+	}
+	if err := os.WriteFile(target, []byte("[workspace]\nname = \"mutated\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreSnapshots(fs, snapshots); err != nil {
+		t.Fatalf("restoreSnapshots: %v", err)
+	}
+	assertCityTomlSymlinkRestored(t, link, target, symlinkedCityTomlOriginal)
+}

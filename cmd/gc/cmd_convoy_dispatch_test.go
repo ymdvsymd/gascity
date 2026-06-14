@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/dispatch"
@@ -1121,6 +1122,12 @@ func TestCmdWorkflowReopenSourceClearsRoutedToForResling(t *testing.T) {
 	if err := store.SetMetadata(source.ID, "gc.routed_to", "mayor"); err != nil {
 		t.Fatalf("SetMetadata(gc.routed_to): %v", err)
 	}
+	if err := store.SetMetadata(source.ID, "gc.session_affinity", "require"); err != nil {
+		t.Fatalf("SetMetadata(gc.session_affinity): %v", err)
+	}
+	if err := store.SetMetadata(source.ID, "gc.continuation_group", "main"); err != nil {
+		t.Fatalf("SetMetadata(gc.continuation_group): %v", err)
+	}
 
 	var stdout, stderr bytes.Buffer
 	if code := cmdWorkflowReopenSource(source.ID, sourceWorkflowStoreSelector{}, &stdout, &stderr); code != 0 {
@@ -1143,6 +1150,12 @@ func TestCmdWorkflowReopenSourceClearsRoutedToForResling(t *testing.T) {
 	}
 	if got := strings.TrimSpace(updated.Metadata["gc.routed_to"]); got != "" {
 		t.Fatalf("gc.routed_to = %q, want cleared (no gc.run_target → legacy blank)", got)
+	}
+	if got := strings.TrimSpace(updated.Metadata["gc.session_affinity"]); got != "" {
+		t.Fatalf("gc.session_affinity = %q, want cleared with unassigned reopen", got)
+	}
+	if got := strings.TrimSpace(updated.Metadata["gc.continuation_group"]); got != "" {
+		t.Fatalf("gc.continuation_group = %q, want cleared with unassigned reopen", got)
 	}
 	if updated.Status != "open" {
 		t.Fatalf("status = %q, want open", updated.Status)
@@ -2928,6 +2941,28 @@ case "$*" in
 esac
 `)
 	assertJSONEqual(t, out, `[{"id":"ga-pending","metadata":{"gc.kind":"retry"}},{"id":"ga-ready","metadata":{"gc.kind":"scope-check"}}]`)
+}
+
+func TestWorkflowServeControlReadyQuerySkipsInstantiatingBeads(t *testing.T) {
+	query := workflowServeControlReadyQuery(config.Agent{Name: config.ControlDispatcherAgentName, Dir: "gascity"})
+	out := runWorkflowServeShellQueryForTest(t, query, map[string]string{
+		"GC_SESSION_NAME": "gascity--control-dispatcher",
+		"GC_ALIAS":        "gascity/control-dispatcher",
+	}, fmt.Sprintf(`#!/bin/sh
+set -eu
+case "$*" in
+  "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
+    printf '[{"id":"ga-instantiating-assigned","metadata":{"%s":"true"}},{"id":"ga-assigned","metadata":{"gc.kind":"retry"}}]'
+    ;;
+  "--readonly --sandbox ready --metadata-field gc.run_target=gascity/control-dispatcher --unassigned --exclude-type=epic --json --sort oldest --limit=20")
+    printf '[{"id":"ga-instantiating-routed","metadata":{"%s":"true"}},{"id":"ga-routed","metadata":{"gc.kind":"scope-check"}}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`, beadmeta.InstantiatingMetadataKey, beadmeta.InstantiatingMetadataKey))
+	assertJSONEqual(t, out, `[{"id":"ga-assigned","metadata":{"gc.kind":"retry"}},{"id":"ga-routed","metadata":{"gc.kind":"scope-check"}}]`)
 }
 
 func TestWorkflowServeControlReadyQueryPreservesQueryPriorityWhenMerging(t *testing.T) {
